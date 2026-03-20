@@ -1,0 +1,557 @@
+package cslb
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// ---------- Transport basic tests ----------
+
+func TestTransport_RoundRobinDistribution(t *testing.T) {
+	// Start 3 backend servers
+	counts := [3]*atomic.Int32{{}, {}, {}}
+	for i := range counts {
+		counts[i] = &atomic.Int32{}
+	}
+
+	servers := make([]*httptest.Server, 3)
+	for i := range servers {
+		idx := i
+		servers[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			counts[idx].Add(1)
+			fmt.Fprintf(w, "backend-%d", idx)
+		}))
+		defer servers[i].Close()
+	}
+
+	tr := NewTransport(
+		WithUpstream("http://myservice.local",
+			Backend(servers[0].URL, Weight(5)),
+			Backend(servers[1].URL, Weight(3)),
+			Backend(servers[2].URL, Weight(2)),
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	for i := 0; i < 100; i++ {
+		resp, err := client.Get("http://myservice.local/test")
+		if err != nil {
+			t.Fatalf("request %d failed: %v", i, err)
+		}
+		resp.Body.Close()
+	}
+
+	c0, c1, c2 := counts[0].Load(), counts[1].Load(), counts[2].Load()
+	t.Logf("distribution: backend-0=%d backend-1=%d backend-2=%d", c0, c1, c2)
+
+	if c0 <= c1 || c1 <= c2 {
+		t.Errorf("expected c0 > c1 > c2, got %d %d %d", c0, c1, c2)
+	}
+}
+
+func TestTransport_NoUpstreamPassthrough(t *testing.T) {
+	// Requests not matching any upstream pass through to the underlying transport
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("direct"))
+	}))
+	defer backend.Close()
+
+	tr := NewTransport(
+		WithRoundTripper(http.DefaultTransport),
+		WithUpstream("http://other.local",
+			Backend(backend.URL),
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	// This request goes to a real server, not matching "other.local"
+	resp, err := client.Get(backend.URL + "/hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "direct" {
+		t.Errorf("expected direct, got %s", string(body))
+	}
+}
+
+func TestTransport_FailoverToNextPeer(t *testing.T) {
+	// First backend always returns 500, second returns 200
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+	}))
+	defer bad.Close()
+
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer good.Close()
+
+	tr := NewTransport(
+		WithUpstream("http://failover.local",
+			Backend(bad.URL),
+			Backend(good.URL),
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Get("http://failover.local/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "ok" {
+		t.Errorf("expected ok, got %s", string(body))
+	}
+}
+
+func TestTransport_BackupFallback(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+	}))
+	defer primary.Close()
+
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("backup"))
+	}))
+	defer backup.Close()
+
+	tr := NewTransport(
+		WithUpstream("http://backup.local",
+			Backend(primary.URL),
+			Backend(backup.URL, AsBackup()),
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Get("http://backup.local/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "backup" {
+		t.Errorf("expected backup, got %s", string(body))
+	}
+}
+
+func TestTransport_HostHeaderPreserved(t *testing.T) {
+	var receivedHost string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHost = r.Host
+		w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	tr := NewTransport(
+		WithUpstream("http://original-host.com",
+			Backend(backend.URL),
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Get("http://original-host.com/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if receivedHost != "original-host.com" {
+		t.Errorf("host header = %q, want original-host.com", receivedHost)
+	}
+}
+
+func TestTransport_PostBodyRetried(t *testing.T) {
+	attempt := &atomic.Int32{}
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		n := attempt.Add(1)
+		if n == 1 {
+			// First attempt: verify body, then fail
+			if string(body) != "hello" {
+				w.WriteHeader(400)
+				return
+			}
+			w.WriteHeader(500)
+			return
+		}
+		// Second attempt: verify body is replayed
+		if string(body) != "hello" {
+			w.WriteHeader(400)
+			fmt.Fprintf(w, "body mismatch: %q", string(body))
+			return
+		}
+		w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	// Two backends pointing to the same server to test retry with body replay
+	tr := NewTransport(
+		WithUpstream("http://post.local",
+			Backend(backend.URL),
+			Backend(backend.URL),
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Post("http://post.local/test", "text/plain", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, body = %s", resp.StatusCode, string(body))
+	}
+}
+
+// ---------- Algorithm-specific transport tests ----------
+
+func TestTransport_LeastConn(t *testing.T) {
+	counts := [2]*atomic.Int32{{}, {}}
+	for i := range counts {
+		counts[i] = &atomic.Int32{}
+	}
+
+	servers := make([]*httptest.Server, 2)
+	for i := range servers {
+		idx := i
+		servers[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			counts[idx].Add(1)
+			w.Write([]byte("ok"))
+		}))
+		defer servers[i].Close()
+	}
+
+	tr := NewTransport(
+		WithUpstream("http://lc.local",
+			Backend(servers[0].URL),
+			Backend(servers[1].URL),
+			UseLeastConn(),
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	for i := 0; i < 100; i++ {
+		resp, err := client.Get("http://lc.local/test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+
+	c0, c1 := counts[0].Load(), counts[1].Load()
+	t.Logf("least_conn: %d %d", c0, c1)
+
+	// Should be roughly even
+	if c0 < 30 || c1 < 30 {
+		t.Errorf("uneven distribution: %d %d", c0, c1)
+	}
+}
+
+func TestTransport_Hash(t *testing.T) {
+	servers := make([]*httptest.Server, 3)
+	for i := range servers {
+		idx := i
+		servers[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, "backend-%d", idx)
+		}))
+		defer servers[i].Close()
+	}
+
+	tr := NewTransport(
+		WithUpstream("http://hash.local",
+			Backend(servers[0].URL),
+			Backend(servers[1].URL),
+			Backend(servers[2].URL),
+			UseHash(func(r *http.Request) string {
+				return r.URL.Path
+			}),
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	// Same path should consistently go to the same backend
+	var firstBody string
+	for i := 0; i < 10; i++ {
+		resp, err := client.Get("http://hash.local/consistent-path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if i == 0 {
+			firstBody = string(body)
+		} else if string(body) != firstBody {
+			t.Errorf("inconsistent hash: got %s, expected %s", string(body), firstBody)
+		}
+	}
+}
+
+func TestTransport_Timeout(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+		w.Write([]byte("slow"))
+	}))
+	defer slow.Close()
+
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("fast"))
+	}))
+	defer fast.Close()
+
+	tr := NewTransport(
+		WithTimeout(500*time.Millisecond),
+		WithUpstream("http://timeout.local",
+			Backend(slow.URL),
+			Backend(fast.URL),
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Get("http://timeout.local/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "fast" {
+		t.Errorf("expected fast, got %s", string(body))
+	}
+}
+
+func TestTransport_BackendSchemeInherited(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	// Extract host:port from backend URL
+	addr := strings.TrimPrefix(backend.URL, "http://")
+
+	tr := NewTransport(
+		WithUpstream("http://inherit.local",
+			Backend(addr), // no scheme — should inherit "http"
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Get("http://inherit.local/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "ok" {
+		t.Errorf("expected ok, got %s", string(body))
+	}
+}
+
+// ---------- NextUpstream tests ----------
+
+func TestTransport_NextUpstreamCodes(t *testing.T) {
+	// backend1 returns 403, backend2 returns 200
+	b1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(403)
+		w.Write([]byte("forbidden"))
+	}))
+	defer b1.Close()
+
+	b2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer b2.Close()
+
+	// Default behavior: 403 is NOT retried (only 5xx)
+	tr := NewTransport(
+		WithUpstream("http://default.local",
+			Backend(b1.URL),
+			Backend(b2.URL),
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Get("http://default.local/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "forbidden" {
+		t.Errorf("default: expected forbidden (no retry on 403), got %s", string(body))
+	}
+
+	// With 403 configured as retry code
+	tr2 := NewTransport(
+		WithNextUpstreamCodes(403, 502, 503, 504),
+		WithUpstream("http://custom.local",
+			Backend(b1.URL),
+			Backend(b2.URL),
+		),
+	)
+	client2 := &http.Client{Transport: tr2}
+
+	resp, err = client2.Get("http://custom.local/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "ok" {
+		t.Errorf("custom: expected ok (retry on 403), got %s", string(body))
+	}
+}
+
+func TestTransport_NextUpstreamCustomCondition(t *testing.T) {
+	// backend1 returns 429, backend2 returns 200
+	b1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(429)
+	}))
+	defer b1.Close()
+
+	b2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer b2.Close()
+
+	tr := NewTransport(
+		WithNextUpstream(func(resp *http.Response, err error) bool {
+			if err != nil {
+				return true
+			}
+			// Retry on 429 (rate limited) and 5xx
+			return resp.StatusCode == 429 || resp.StatusCode >= 500
+		}),
+		WithUpstream("http://cond.local",
+			Backend(b1.URL),
+			Backend(b2.URL),
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Get("http://cond.local/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "ok" {
+		t.Errorf("expected ok (retry on 429), got %s", string(body))
+	}
+}
+
+func TestTransport_NextUpstreamCodesNoRetry(t *testing.T) {
+	// Both backends return 500, but we only retry on 502
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		w.Write([]byte("internal error"))
+	}))
+	defer b.Close()
+
+	tr := NewTransport(
+		WithNextUpstreamCodes(502, 503), // 500 is NOT in the list
+		WithUpstream("http://noskip.local",
+			Backend(b.URL),
+			Backend(b.URL),
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Get("http://noskip.local/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Should NOT retry — 500 is not in the configured codes
+	if resp.StatusCode != 500 {
+		t.Errorf("expected 500 (no retry), got %d", resp.StatusCode)
+	}
+}
+
+// ---------- clientIP tests ----------
+
+func TestClientIP_XRealIP(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("X-Real-IP", "1.2.3.4")
+	ip := clientIP(req)
+	if ip.String() != "1.2.3.4" {
+		t.Errorf("got %s, want 1.2.3.4", ip)
+	}
+}
+
+func TestClientIP_XForwardedFor(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.0.1, 10.0.0.2")
+	ip := clientIP(req)
+	if ip.String() != "10.0.0.1" {
+		t.Errorf("got %s, want 10.0.0.1", ip)
+	}
+}
+
+func TestClientIP_RemoteAddr(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "192.168.1.1:12345"
+	ip := clientIP(req)
+	if ip.String() != "192.168.1.1" {
+		t.Errorf("got %s, want 192.168.1.1", ip)
+	}
+}
+
+// ---------- Option tests ----------
+
+func TestOptions_Weight(t *testing.T) {
+	p := &Peer{}
+	Weight(5)(p)
+	if p.Weight != 5 {
+		t.Errorf("Weight = %d, want 5", p.Weight)
+	}
+}
+
+func TestOptions_MaxFails(t *testing.T) {
+	p := &Peer{}
+	MaxFails(3)(p)
+	if p.MaxFails != 3 {
+		t.Errorf("MaxFails = %d, want 3", p.MaxFails)
+	}
+}
+
+func TestOptions_FailTimeout(t *testing.T) {
+	p := &Peer{}
+	FailTimeout(30 * time.Second)(p)
+	if p.FailTimeout != 30*time.Second {
+		t.Errorf("FailTimeout = %v, want 30s", p.FailTimeout)
+	}
+}
+
+func TestOptions_AsBackup(t *testing.T) {
+	p := &Peer{}
+	AsBackup()(p)
+	if !p.Backup {
+		t.Error("Backup should be true")
+	}
+}
+
+func TestOptions_AsDown(t *testing.T) {
+	p := &Peer{}
+	AsDown()(p)
+	if !p.Down {
+		t.Error("Down should be true")
+	}
+}
