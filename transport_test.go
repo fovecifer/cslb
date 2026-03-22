@@ -1,6 +1,7 @@
 package cslb
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
@@ -553,5 +554,83 @@ func TestOptions_AsDown(t *testing.T) {
 	AsDown()(p)
 	if !p.Down {
 		t.Error("Down should be true")
+	}
+}
+
+func TestTransport_ProxySSLName(t *testing.T) {
+	// Start a TLS backend that reports the SNI it received
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sni := r.TLS.ServerName
+		fmt.Fprintf(w, "sni=%s", sni)
+	}))
+	defer backend.Close()
+
+	// Extract the test server's cert pool so we can trust it
+	certPool := backend.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
+
+	// Create a custom transport that trusts the test cert but does NOT set ServerName,
+	// so we can verify that ProxySSLName is what sets it.
+	baseRT := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			RootCAs: certPool,
+			// InsecureSkipVerify so the test works despite ServerName mismatch
+			InsecureSkipVerify: true,
+		},
+	}
+
+	transport := NewTransport(
+		WithRoundTripper(baseRT),
+		WithUpstream("https://myservice.local",
+			Backend(backend.Listener.Addr().String()),
+			ProxySSLName("custom-sni.example.com"),
+		),
+	)
+
+	client := &http.Client{Transport: transport}
+	resp, err := client.Get("https://myservice.local/test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	expected := "sni=custom-sni.example.com"
+	if string(body) != expected {
+		t.Errorf("got %q, want %q", string(body), expected)
+	}
+}
+
+func TestTransport_ProxySSLName_DefaultTransport(t *testing.T) {
+	// Verify ProxySSLName works with the default transport (no WithRoundTripper)
+	transport := NewTransport(
+		WithUpstream("https://ssl.local",
+			Backend("https://10.0.0.1:443"),
+			ProxySSLName("ssl.example.com"),
+		),
+	)
+
+	// Check that the upstream got a cloned transport with the right ServerName
+	key := upstreamKey{scheme: "https", host: "ssl.local"}
+	ups := transport.upstreams[key]
+	if ups == nil {
+		t.Fatal("upstream not found")
+	}
+	if ups.sslName != "ssl.example.com" {
+		t.Errorf("sslName = %q, want %q", ups.sslName, "ssl.example.com")
+	}
+	if ups.transport == nil {
+		t.Fatal("per-upstream transport should be set")
+	}
+	ht, ok := ups.transport.(*http.Transport)
+	if !ok {
+		t.Fatal("per-upstream transport should be *http.Transport")
+	}
+	if ht.TLSClientConfig == nil || ht.TLSClientConfig.ServerName != "ssl.example.com" {
+		t.Errorf("TLSClientConfig.ServerName = %q, want %q",
+			ht.TLSClientConfig.ServerName, "ssl.example.com")
+	}
+	// Ensure it's a different transport instance than the base
+	if ups.transport == transport.transport {
+		t.Error("per-upstream transport should be a clone, not the same instance")
 	}
 }

@@ -3,6 +3,7 @@ package cslb
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -44,10 +45,12 @@ type upstreamKey struct {
 
 // upstream holds the balancer and peer-to-address mapping for one upstream group.
 type upstream struct {
-	balancer Balancer
-	backends map[*Peer]*backendAddr
-	hashFunc func(*http.Request) string
-	algo     AlgorithmType
+	balancer  Balancer
+	backends  map[*Peer]*backendAddr
+	hashFunc  func(*http.Request) string
+	algo      AlgorithmType
+	sslName   string             // SNI override for TLS connections (proxy_ssl_name)
+	transport http.RoundTripper  // per-upstream transport with custom TLS ServerName
 }
 
 // backendAddr stores the rewritten scheme and host for a backend peer.
@@ -80,6 +83,7 @@ type upstreamConfig struct {
 	addrs         map[*Peer]*backendAddr
 	algo          AlgorithmType
 	hashFunc      func(*http.Request) string
+	sslName       string
 }
 
 // UpstreamOption configures an upstream group.
@@ -132,6 +136,27 @@ func NewTransport(opts ...TransportOption) *Transport {
 			ExpectContinueTimeout: 1 * time.Second,
 		}
 	}
+
+	// Create per-upstream transports for upstreams with custom SSL names.
+	// Each upstream with ProxySSLName gets a cloned transport whose
+	// TLSClientConfig.ServerName is set, so TLS handshakes use the
+	// specified hostname for SNI instead of the backend address.
+	for _, ups := range t.upstreams {
+		if ups.sslName == "" {
+			continue
+		}
+		ht, ok := t.transport.(*http.Transport)
+		if !ok {
+			panic("cslb: ProxySSLName requires the underlying transport to be *http.Transport")
+		}
+		cloned := ht.Clone()
+		if cloned.TLSClientConfig == nil {
+			cloned.TLSClientConfig = &tls.Config{}
+		}
+		cloned.TLSClientConfig.ServerName = ups.sslName
+		ups.transport = cloned
+	}
+
 	return t
 }
 
@@ -246,6 +271,7 @@ func WithUpstream(pattern string, opts ...UpstreamOption) TransportOption {
 			backends: cfg.addrs,
 			hashFunc: cfg.hashFunc,
 			algo:     cfg.algo,
+			sslName:  cfg.sslName,
 		}
 	}
 }
@@ -312,6 +338,30 @@ func UseRandom() UpstreamOption {
 // UseRandomTwo selects random-two (Power of Two Choices) algorithm.
 func UseRandomTwo() UpstreamOption {
 	return func(cfg *upstreamConfig) { cfg.algo = AlgoRandomTwo }
+}
+
+// ProxySSLName sets the server name used for SNI (Server Name Indication)
+// in TLS handshakes with backend servers. This corresponds to nginx's
+// proxy_ssl_name directive combined with proxy_ssl_server_name on.
+//
+// When backends are addressed by IP (e.g., "https://10.0.0.1:443"), TLS
+// handshakes normally send the IP as SNI, which breaks SNI-based routing
+// and certificate verification. ProxySSLName overrides the SNI to the
+// specified hostname.
+//
+// Only works with the default transport or a custom *http.Transport
+// provided via WithRoundTripper. The transport is cloned per-upstream
+// so the override does not affect other upstream groups.
+//
+// Example:
+//
+//	cslb.WithUpstream("https://api.example.com",
+//	    cslb.Backend("https://10.0.0.1:443"),
+//	    cslb.Backend("https://10.0.0.2:443"),
+//	    cslb.ProxySSLName("api.example.com"),
+//	)
+func ProxySSLName(name string) UpstreamOption {
+	return func(cfg *upstreamConfig) { cfg.sslName = name }
 }
 
 // ---------- Backend options ----------
@@ -425,7 +475,13 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			req = req.WithContext(ctx)
 		}
 
-		resp, err := t.transport.RoundTrip(req)
+		// Use per-upstream transport (with custom SNI) if available
+		rt := t.transport
+		if ups.transport != nil {
+			rt = ups.transport
+		}
+
+		resp, err := rt.RoundTrip(req)
 
 		// Handle context cancellation
 		if err != nil {

@@ -533,7 +533,43 @@ func Example_passthrough() {
 }
 
 // ----------------------------------------------------------------
-// Example 14: Hash by cookie for session affinity
+// Example 14: ProxySSLName - override TLS SNI for backend connections
+// ----------------------------------------------------------------
+// When backends are addressed by IP, TLS handshakes normally send
+// the IP as SNI. ProxySSLName overrides the SNI to the specified
+// hostname, matching nginx's proxy_ssl_server_name + proxy_ssl_name.
+func Example_proxySSLName() {
+	// Start a TLS backend that reports the SNI it received
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "sni=%s", r.TLS.ServerName)
+	}))
+	defer backend.Close()
+
+	// Trust the test server's certificate
+	testTransport := backend.Client().Transport.(*http.Transport)
+
+	transport := cslb.NewTransport(
+		cslb.WithRoundTripper(testTransport),
+		cslb.WithUpstream("https://api.example.com",
+			// Backend is an IP address — without ProxySSLName, SNI would be the IP
+			cslb.Backend(backend.URL),
+			// Override SNI to the desired hostname
+			cslb.ProxySSLName("api.example.com"),
+		),
+	)
+
+	client := &http.Client{Transport: transport}
+	resp, _ := client.Get("https://api.example.com/data")
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	fmt.Println(string(body))
+
+	// Output:
+	// sni=api.example.com
+}
+
+// ----------------------------------------------------------------
+// Example 15: Hash by cookie for session affinity
 // ----------------------------------------------------------------
 // UseHash's keyFunc can extract any request attribute as the hash key.
 // Common use cases: route by Cookie, Header, or query parameter for session affinity.
