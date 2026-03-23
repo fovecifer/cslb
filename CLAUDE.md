@@ -6,6 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Always use English for all generated code, comments, commit messages, and documentation in this project.
 - Never use `panic` in library code; return errors instead.
+- Always update CHANGELOG.md when releasing a new version.
 
 ## Commands
 
