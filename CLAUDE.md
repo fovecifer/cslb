@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Always use English for all generated code, comments, commit messages, and documentation in this project.
 - Never use `panic` in library code; return errors instead.
 - Always update CHANGELOG.md when releasing a new version.
+- Follow the **fail-fast** strategy: validate inputs and preconditions at the earliest possible point (constructors, option functions, public API boundaries) and return an error immediately rather than deferring failure to a later call. Never silently ignore errors (`_ = err`) — either handle them or propagate them to the caller.
 
 ## Commands
 
