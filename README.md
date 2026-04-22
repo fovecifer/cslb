@@ -65,6 +65,9 @@ func main() {
 }
 ```
 
+If you want configuration validation during construction instead of deferred
+errors at request time, use `NewTransportE(...)` and handle the returned error.
+
 ## Algorithms
 
 | Algorithm | Constructor | Description |

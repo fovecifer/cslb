@@ -18,6 +18,7 @@
 package cslb
 
 import (
+	"errors"
 	"sync"
 	"time"
 )
@@ -75,6 +76,9 @@ func BuildGroups(peers []*Peer) (primary *PeerGroup, backup *PeerGroup) {
 	backup = &PeerGroup{}
 
 	for _, p := range peers {
+		if p == nil {
+			continue
+		}
 		p.init()
 		if p.Backup {
 			backup.Peers = append(backup.Peers, p)
@@ -133,13 +137,22 @@ type PickResult struct {
 
 // Done reports the request result. Must be called exactly once.
 func (r *PickResult) Done(failed bool) {
+	if r == nil || r.picker == nil {
+		return
+	}
 	r.picker.Done(r.Peer, failed)
 }
 
 // PickOne is a convenience that creates a picker, picks one peer,
 // and returns a result that must be Done()'d.
 func PickOne(b Balancer) *PickResult {
+	if b == nil {
+		return nil
+	}
 	pk := b.NewPicker()
+	if pk == nil {
+		return nil
+	}
 	p := pk.Pick()
 	if p == nil {
 		return nil
@@ -149,7 +162,17 @@ func PickOne(b Balancer) *PickResult {
 
 // PickWithRetry creates a picker and retries across peers on failure.
 func PickWithRetry(b Balancer, tryFunc func(addr string) error) (*Peer, error) {
+	if b == nil {
+		return nil, ErrNilBalancer
+	}
+	if tryFunc == nil {
+		return nil, ErrNilTryFunc
+	}
+
 	pk := b.NewPicker()
+	if pk == nil {
+		return nil, ErrNoPeerAvailable
+	}
 
 	for {
 		p := pk.Pick()
@@ -169,7 +192,11 @@ func PickWithRetry(b Balancer, tryFunc func(addr string) error) (*Peer, error) {
 }
 
 // ErrNoPeerAvailable is returned when no peer can be selected.
-var ErrNoPeerAvailable = &noPeerError{}
+var (
+	ErrNoPeerAvailable = &noPeerError{}
+	ErrNilBalancer     = errors.New("cslb: nil balancer")
+	ErrNilTryFunc      = errors.New("cslb: nil tryFunc")
+)
 
 type noPeerError struct{}
 

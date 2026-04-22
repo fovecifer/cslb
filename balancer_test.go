@@ -400,6 +400,45 @@ func TestPickWithRetry_AllFail(t *testing.T) {
 	}
 }
 
+func TestPickOne_NilBalancer(t *testing.T) {
+	if PickOne(nil) != nil {
+		t.Fatal("expected nil result for nil balancer")
+	}
+}
+
+func TestPickWithRetry_NilBalancer(t *testing.T) {
+	_, err := PickWithRetry(nil, func(addr string) error { return nil })
+	if err != ErrNilBalancer {
+		t.Fatalf("got %v, want %v", err, ErrNilBalancer)
+	}
+}
+
+func TestPickWithRetry_NilTryFunc(t *testing.T) {
+	b := NewRoundRobin([]*Peer{
+		{Addr: "A", Weight: 1},
+	})
+
+	_, err := PickWithRetry(b, nil)
+	if err != ErrNilTryFunc {
+		t.Fatalf("got %v, want %v", err, ErrNilTryFunc)
+	}
+}
+
+func TestBuildGroups_SkipsNilPeers(t *testing.T) {
+	primary, backup := BuildGroups([]*Peer{
+		nil,
+		{Addr: "A", Weight: 1},
+		{Addr: "B", Weight: 1, Backup: true},
+	})
+
+	if len(primary.Peers) != 1 || primary.Peers[0].Addr != "A" {
+		t.Fatalf("unexpected primary peers: %+v", primary.Peers)
+	}
+	if backup == nil || len(backup.Peers) != 1 || backup.Peers[0].Addr != "B" {
+		t.Fatalf("unexpected backup peers: %+v", backup.Peers)
+	}
+}
+
 // ---------- Pluggable: same code works with any algorithm ----------
 
 func TestPluggable_AllAlgorithms(t *testing.T) {

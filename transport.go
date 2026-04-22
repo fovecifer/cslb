@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -14,6 +16,14 @@ import (
 )
 
 const defaultMaxBodyBuffer = 32 << 20 // 32MB
+
+var (
+	ErrNilRequest            = errors.New("cslb: nil request")
+	ErrNilRequestURL         = errors.New("cslb: nil request URL")
+	ErrNilRoundTripper       = errors.New("cslb: nil underlying transport")
+	ErrInvalidRoundTrip      = errors.New("cslb: underlying transport returned nil response and nil error")
+	ErrInvalidUpstreamConfig = errors.New("cslb: invalid upstream configuration")
+)
 
 // ---------- Transport: http.RoundTripper with client-side load balancing ----------
 
@@ -27,6 +37,7 @@ type Transport struct {
 	connectTimeout time.Duration
 	maxBodyBuffer  int64
 	nextUpstream   NextUpstreamCondition
+	initErr        error
 }
 
 // NextUpstreamCondition determines whether a response should be considered
@@ -49,8 +60,8 @@ type upstream struct {
 	backends  map[*Peer]*backendAddr
 	hashFunc  func(*http.Request) string
 	algo      AlgorithmType
-	sslName   string             // SNI override for TLS connections (proxy_ssl_name)
-	transport http.RoundTripper  // per-upstream transport with custom TLS ServerName
+	sslName   string            // SNI override for TLS connections (proxy_ssl_name)
+	transport http.RoundTripper // per-upstream transport with custom TLS ServerName
 }
 
 // backendAddr stores the rewritten scheme and host for a backend peer.
@@ -84,6 +95,7 @@ type upstreamConfig struct {
 	algo          AlgorithmType
 	hashFunc      func(*http.Request) string
 	sslName       string
+	err           error
 }
 
 // UpstreamOption configures an upstream group.
@@ -95,6 +107,9 @@ type BackendOption func(*Peer)
 // ---------- Constructor ----------
 
 // NewTransport creates a new load-balancing transport with the given options.
+// Invalid configuration is retained on the returned transport and surfaced
+// through Err() / RoundTrip() for backward compatibility. Use NewTransportE
+// to fail fast with an immediate error.
 //
 // Usage:
 //
@@ -110,6 +125,13 @@ type BackendOption func(*Peer)
 //	)
 //	client := &http.Client{Transport: transport}
 func NewTransport(opts ...TransportOption) *Transport {
+	t, _ := NewTransportE(opts...)
+	return t
+}
+
+// NewTransportE creates a new load-balancing transport and returns any
+// configuration error immediately instead of panicking.
+func NewTransportE(opts ...TransportOption) (*Transport, error) {
 	t := &Transport{
 		upstreams:     make(map[upstreamKey]*upstream),
 		maxBodyBuffer: defaultMaxBodyBuffer,
@@ -147,7 +169,8 @@ func NewTransport(opts ...TransportOption) *Transport {
 		}
 		ht, ok := t.transport.(*http.Transport)
 		if !ok {
-			panic("cslb: ProxySSLName requires the underlying transport to be *http.Transport")
+			t.addInitError(errors.New("cslb: ProxySSLName requires the underlying transport to be *http.Transport"))
+			continue
 		}
 		cloned := ht.Clone()
 		if cloned.TLSClientConfig == nil {
@@ -157,7 +180,37 @@ func NewTransport(opts ...TransportOption) *Transport {
 		ups.transport = cloned
 	}
 
-	return t
+	return t, t.initErr
+}
+
+// Err returns the configuration error captured during construction, if any.
+func (t *Transport) Err() error {
+	if t == nil {
+		return ErrNilRoundTripper
+	}
+	return t.initErr
+}
+
+func (t *Transport) addInitError(err error) {
+	if err == nil {
+		return
+	}
+	if t.initErr == nil {
+		t.initErr = err
+		return
+	}
+	t.initErr = errors.Join(t.initErr, err)
+}
+
+func (cfg *upstreamConfig) addError(err error) {
+	if err == nil {
+		return
+	}
+	if cfg.err == nil {
+		cfg.err = err
+		return
+	}
+	cfg.err = errors.Join(cfg.err, err)
 }
 
 // ---------- Transport options ----------
@@ -236,8 +289,9 @@ func WithNextUpstreamCodes(codes ...int) TransportOption {
 func WithUpstream(pattern string, opts ...UpstreamOption) TransportOption {
 	return func(t *Transport) {
 		u, err := url.Parse(pattern)
-		if err != nil {
-			panic("cslb: invalid upstream pattern: " + pattern)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			t.addInitError(fmt.Errorf("cslb: invalid upstream pattern: %q", pattern))
+			return
 		}
 		key := upstreamKey{scheme: u.Scheme, host: u.Host}
 
@@ -247,6 +301,14 @@ func WithUpstream(pattern string, opts ...UpstreamOption) TransportOption {
 		}
 		for _, opt := range opts {
 			opt(cfg)
+		}
+		if cfg.err != nil {
+			t.addInitError(fmt.Errorf("cslb: upstream %q: %w", pattern, cfg.err))
+			return
+		}
+		if len(cfg.peers) == 0 {
+			t.addInitError(fmt.Errorf("cslb: upstream %q has no backends", pattern))
+			return
 		}
 
 		// Build balancer based on algorithm
@@ -283,16 +345,26 @@ func WithUpstream(pattern string, opts ...UpstreamOption) TransportOption {
 // it inherits from the upstream pattern.
 func Backend(addr string, opts ...BackendOption) UpstreamOption {
 	return func(cfg *upstreamConfig) {
+		if addr == "" {
+			cfg.addError(errors.New("cslb: backend address must not be empty"))
+			return
+		}
+
 		scheme := cfg.defaultScheme
 		host := addr
 
 		if strings.Contains(addr, "://") {
 			u, err := url.Parse(addr)
-			if err != nil {
-				panic("cslb: invalid backend address: " + addr)
+			if err != nil || u.Scheme == "" || u.Host == "" {
+				cfg.addError(fmt.Errorf("cslb: invalid backend address: %q", addr))
+				return
 			}
 			scheme = u.Scheme
 			host = u.Host
+		}
+		if host == "" {
+			cfg.addError(fmt.Errorf("cslb: invalid backend address: %q", addr))
+			return
 		}
 
 		p := &Peer{Addr: addr}
@@ -326,6 +398,10 @@ func UseIPHash() UpstreamOption {
 func UseHash(keyFunc func(*http.Request) string) UpstreamOption {
 	return func(cfg *upstreamConfig) {
 		cfg.algo = AlgoHash
+		if keyFunc == nil {
+			cfg.addError(errors.New("cslb: hash key function must not be nil"))
+			return
+		}
 		cfg.hashFunc = keyFunc
 	}
 }
@@ -414,14 +490,33 @@ func (c *cancelCloser) Close() error {
 // configured upstreams, selects a backend, rewrites the URL, and forwards
 // the request. Failed attempts are retried on other backends.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t == nil {
+		return nil, ErrNilRoundTripper
+	}
+	if t.initErr != nil {
+		return nil, t.initErr
+	}
+	if req == nil {
+		return nil, ErrNilRequest
+	}
+	if req.URL == nil {
+		return nil, ErrNilRequestURL
+	}
+	if t.transport == nil {
+		return nil, ErrNilRoundTripper
+	}
+
 	key := upstreamKey{scheme: req.URL.Scheme, host: req.URL.Host}
 	ups, ok := t.upstreams[key]
 	if !ok {
-		return t.transport.RoundTrip(req)
+		return t.roundTrip(t.transport, req)
 	}
 
 	// Create picker based on algorithm
 	pk := t.newPicker(ups, req)
+	if pk == nil {
+		return nil, ErrInvalidUpstreamConfig
+	}
 
 	// Prepare body for retries
 	getBody, cleanup, err := t.prepareBody(req)
@@ -442,6 +537,10 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 
 		addr := ups.backends[peer]
+		if addr == nil {
+			pk.Done(peer, true)
+			return nil, fmt.Errorf("cslb: selected peer %q has no backend address", peer.Addr)
+		}
 
 		// Clone URL to avoid mutating shared state
 		u := *req.URL
@@ -481,7 +580,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			rt = ups.transport
 		}
 
-		resp, err := rt.RoundTrip(req)
+		resp, err := t.roundTrip(rt, req)
 
 		// Handle context cancellation
 		if err != nil {
@@ -518,9 +617,25 @@ func (t *Transport) shouldRetry(resp *http.Response, err error) bool {
 	return err != nil || resp.StatusCode >= 500
 }
 
+func (t *Transport) roundTrip(rt http.RoundTripper, req *http.Request) (*http.Response, error) {
+	if rt == nil {
+		return nil, ErrNilRoundTripper
+	}
+
+	resp, err := rt.RoundTrip(req)
+	if resp == nil && err == nil {
+		return nil, ErrInvalidRoundTrip
+	}
+	return resp, err
+}
+
 // newPicker creates a per-request picker, using algorithm-specific constructors
 // for IPHash and Hash that require request context.
 func (t *Transport) newPicker(ups *upstream, req *http.Request) Picker {
+	if ups == nil || ups.balancer == nil {
+		return nil
+	}
+
 	switch ups.algo {
 	case AlgoIPHash:
 		if h, ok := ups.balancer.(*IPHash); ok {
@@ -573,16 +688,16 @@ func (t *Transport) prepareBody(req *http.Request) (getBody func() (io.ReadClose
 		stat, _ := f.Stat()
 		req.ContentLength = stat.Size()
 		return func() (io.ReadCloser, error) {
-			_, err := f.Seek(0, 0)
-			if err != nil {
-				return nil, err
-			}
-			return io.NopCloser(f), nil
-		}, func() {
-			name := f.Name()
-			f.Close()
-			os.Remove(name)
-		}, nil
+				_, err := f.Seek(0, 0)
+				if err != nil {
+					return nil, err
+				}
+				return io.NopCloser(f), nil
+			}, func() {
+				name := f.Name()
+				f.Close()
+				os.Remove(name)
+			}, nil
 	}
 
 	// Fits in memory

@@ -12,6 +12,12 @@ import (
 	"time"
 )
 
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 // ---------- Transport basic tests ----------
 
 func TestTransport_RoundRobinDistribution(t *testing.T) {
@@ -632,5 +638,114 @@ func TestTransport_ProxySSLName_DefaultTransport(t *testing.T) {
 	// Ensure it's a different transport instance than the base
 	if ups.transport == transport.transport {
 		t.Error("per-upstream transport should be a clone, not the same instance")
+	}
+}
+
+func TestNewTransportE_InvalidUpstreamPattern(t *testing.T) {
+	_, err := NewTransportE(
+		WithUpstream("not-a-valid-upstream",
+			Backend("http://127.0.0.1:8080"),
+		),
+	)
+	if err == nil {
+		t.Fatal("expected error for invalid upstream pattern")
+	}
+	if !strings.Contains(err.Error(), `invalid upstream pattern: "not-a-valid-upstream"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNewTransportE_InvalidBackendAddress(t *testing.T) {
+	_, err := NewTransportE(
+		WithUpstream("http://service.local",
+			Backend("http://"),
+		),
+	)
+	if err == nil {
+		t.Fatal("expected error for invalid backend address")
+	}
+	if !strings.Contains(err.Error(), `invalid backend address: "http://"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNewTransportE_HashRequiresKeyFunc(t *testing.T) {
+	_, err := NewTransportE(
+		WithUpstream("http://hash.local",
+			Backend("http://127.0.0.1:8080"),
+			UseHash(nil),
+		),
+	)
+	if err == nil {
+		t.Fatal("expected error for nil hash key func")
+	}
+	if !strings.Contains(err.Error(), "hash key function must not be nil") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNewTransportE_ProxySSLNameRequiresHTTPTransport(t *testing.T) {
+	_, err := NewTransportE(
+		WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Request:    req,
+			}, nil
+		})),
+		WithUpstream("https://ssl.local",
+			Backend("https://10.0.0.1:443"),
+			ProxySSLName("ssl.example.com"),
+		),
+	)
+	if err == nil {
+		t.Fatal("expected error for non-*http.Transport with ProxySSLName")
+	}
+	if !strings.Contains(err.Error(), "ProxySSLName requires the underlying transport to be *http.Transport") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNewTransport_BackwardCompatibleInitError(t *testing.T) {
+	transport := NewTransport(
+		WithUpstream("not-a-valid-upstream",
+			Backend("http://127.0.0.1:8080"),
+		),
+	)
+
+	if err := transport.Err(); err == nil {
+		t.Fatal("expected construction error to be retained on transport")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+	_, err := transport.RoundTrip(req)
+	if err == nil {
+		t.Fatal("expected RoundTrip to surface retained init error")
+	}
+	if !strings.Contains(err.Error(), `invalid upstream pattern: "not-a-valid-upstream"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestTransport_RoundTripNilRequest(t *testing.T) {
+	transport := NewTransport()
+
+	_, err := transport.RoundTrip(nil)
+	if err != ErrNilRequest {
+		t.Fatalf("got %v, want %v", err, ErrNilRequest)
+	}
+}
+
+func TestTransport_InvalidUnderlyingRoundTrip(t *testing.T) {
+	transport := NewTransport(
+		WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return nil, nil
+		})),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+	_, err := transport.RoundTrip(req)
+	if err != ErrInvalidRoundTrip {
+		t.Fatalf("got %v, want %v", err, ErrInvalidRoundTrip)
 	}
 }

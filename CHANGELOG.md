@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Removed constructor-time `panic` paths from transport configuration.
+- Added `NewTransportE` and `Transport.Err()` so invalid configuration can be
+  reported as regular errors instead of crashing the caller.
+- Hardened public helpers and `RoundTrip` against nil inputs and invalid
+  `RoundTripper` implementations that previously could trigger runtime panics.
+
 ## [v1.1.0] - 2026-03-22
 
 ### Added
