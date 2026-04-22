@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fovecifer/cslb"
+	"github.com/fovecifer/cslb/v2"
 )
 
 // ----------------------------------------------------------------
@@ -29,9 +29,11 @@ func Example_minimal() {
 	defer b2.Close()
 
 	transport := cslb.NewTransport(
-		cslb.WithUpstream("http://api.example.com",
-			cslb.Backend(b1.URL, cslb.Weight(3)), // weight 3, receives 3/4 of traffic
-			cslb.Backend(b2.URL, cslb.Weight(1)), // weight 1, receives 1/4 of traffic
+		cslb.WithUpstreams(
+			cslb.Upstream("http://api.example.com",
+				cslb.Server(b1.URL, cslb.Weight(3)), // weight 3, receives 3/4 of traffic
+				cslb.Server(b2.URL, cslb.Weight(1)), // weight 1, receives 1/4 of traffic
+			),
 		),
 	)
 
@@ -60,51 +62,47 @@ func Example_algorithms() {
 	defer b2.Close()
 
 	transport := cslb.NewTransport(
-		// Algorithm 1: Weighted round-robin (default, UseRoundRobin can be omitted)
-		cslb.WithUpstream("http://rr.local",
-			cslb.Backend(b1.URL, cslb.Weight(5)),
-			cslb.Backend(b2.URL, cslb.Weight(1)),
-			cslb.UseRoundRobin(), // optional, this is the default
-		),
+		cslb.WithUpstreams(
+			// Algorithm 1: Weighted round-robin (default, RoundRobin can be omitted)
+			cslb.Upstream("http://rr.local",
+				cslb.Server(b1.URL, cslb.Weight(5)),
+				cslb.Server(b2.URL, cslb.Weight(1)),
+			).RoundRobin(),
 
-		// Algorithm 2: Least connections - prefers the backend with fewest active connections
-		cslb.WithUpstream("http://lc.local",
-			cslb.Backend(b1.URL),
-			cslb.Backend(b2.URL),
-			cslb.UseLeastConn(),
-		),
+			// Algorithm 2: Least connections - prefers the backend with fewest active connections
+			cslb.Upstream("http://lc.local",
+				cslb.Server(b1.URL),
+				cslb.Server(b2.URL),
+			).LeastConn(),
 
-		// Algorithm 3: IP Hash - same client IP always routes to the same backend (session affinity)
-		// Client IP is extracted from X-Real-IP -> X-Forwarded-For -> RemoteAddr
-		cslb.WithUpstream("http://iphash.local",
-			cslb.Backend(b1.URL),
-			cslb.Backend(b2.URL),
-			cslb.UseIPHash(),
-		),
+			// Algorithm 3: IP Hash - same client IP always routes to the same backend (session affinity)
+			// Client IP is extracted from X-Real-IP -> X-Forwarded-For -> RemoteAddr
+			cslb.Upstream("http://iphash.local",
+				cslb.Server(b1.URL),
+				cslb.Server(b2.URL),
+			).IPHash(),
 
-		// Algorithm 4: Key Hash - consistent routing based on a custom key
-		// Useful for caching: same URL always hits the same backend, improving cache hit rate
-		cslb.WithUpstream("http://hash.local",
-			cslb.Backend(b1.URL),
-			cslb.Backend(b2.URL),
-			cslb.UseHash(func(r *http.Request) string {
+			// Algorithm 4: Key Hash - consistent routing based on a custom key
+			// Useful for caching: same URL always hits the same backend, improving cache hit rate
+			cslb.Upstream("http://hash.local",
+				cslb.Server(b1.URL),
+				cslb.Server(b2.URL),
+			).Hash(func(r *http.Request) string {
 				return r.URL.Path // hash by path
 			}),
-		),
 
-		// Algorithm 5: Random
-		cslb.WithUpstream("http://rand.local",
-			cslb.Backend(b1.URL),
-			cslb.Backend(b2.URL),
-			cslb.UseRandom(),
-		),
+			// Algorithm 5: Random
+			cslb.Upstream("http://rand.local",
+				cslb.Server(b1.URL),
+				cslb.Server(b2.URL),
+			).Random(),
 
-		// Algorithm 6: Random two (Power of Two Choices)
-		// Picks two random backends and selects the one with fewer connections
-		cslb.WithUpstream("http://rand2.local",
-			cslb.Backend(b1.URL),
-			cslb.Backend(b2.URL),
-			cslb.UseRandomTwo(),
+			// Algorithm 6: Random two (Power of Two Choices)
+			// Picks two random backends and selects the one with fewer connections
+			cslb.Upstream("http://rand2.local",
+				cslb.Server(b1.URL),
+				cslb.Server(b2.URL),
+			).RandomTwo(),
 		),
 	)
 
@@ -140,23 +138,25 @@ func Example_backendOptions() {
 	addr := strings.TrimPrefix(b.URL, "http://")
 
 	transport := cslb.NewTransport(
-		cslb.WithUpstream("http://backend-opts.local",
-			// Backend 1: all parameters configured
-			cslb.Backend(b.URL,
-				cslb.Weight(10),                       // weight (default 1)
-				cslb.MaxFails(3),                      // mark unavailable after 3 consecutive failures (default 1)
-				cslb.FailTimeout(30*time.Second),       // how long a failed backend stays unavailable (default 10s)
-				cslb.MaxConns(200),                    // max concurrent connections (default 0 = unlimited)
+		cslb.WithUpstreams(
+			cslb.Upstream("http://backend-opts.local",
+				// Server 1: all parameters configured
+				cslb.Server(b.URL,
+					cslb.Weight(10),                  // weight (default 1)
+					cslb.MaxFails(3),                 // mark unavailable after 3 consecutive failures (default 1)
+					cslb.FailTimeout(30*time.Second), // how long a failed backend stays unavailable (default 10s)
+					cslb.MaxConns(200),               // max concurrent connections (default 0 = unlimited)
+				),
+
+				// Server 2: scheme omitted, inherits "http" from the upstream pattern
+				cslb.Server(addr), // equivalent to Server("http://"+addr)
+
+				// Server 3: backup server - only used when all primary servers are unavailable
+				cslb.Server(b.URL, cslb.Backup()),
+
+				// Server 4: marked as initially down
+				cslb.Server(b.URL, cslb.Down()),
 			),
-
-			// Backend 2: scheme omitted, inherits "http" from the upstream pattern
-			cslb.Backend(addr), // equivalent to Backend("http://"+addr)
-
-			// Backend 3: backup server - only used when all primary servers are unavailable
-			cslb.Backend(b.URL, cslb.AsBackup()),
-
-			// Backend 4: marked as initially down
-			cslb.Backend(b.URL, cslb.AsDown()),
 		),
 	)
 
@@ -186,9 +186,11 @@ func Example_failoverAndBackup() {
 	defer good.Close()
 
 	transport := cslb.NewTransport(
-		cslb.WithUpstream("http://failover.local",
-			cslb.Backend(bad.URL),                    // primary (returns 502)
-			cslb.Backend(good.URL, cslb.AsBackup()),  // backup server
+		cslb.WithUpstreams(
+			cslb.Upstream("http://failover.local",
+				cslb.Server(bad.URL),                 // primary (returns 502)
+				cslb.Server(good.URL, cslb.Backup()), // backup server
+			),
 		),
 	)
 
@@ -224,9 +226,11 @@ func Example_nextUpstreamCodes() {
 	// Equivalent to nginx: proxy_next_upstream error timeout http_429 http_502 http_503 http_504;
 	t1 := cslb.NewTransport(
 		cslb.WithNextUpstreamCodes(429, 502, 503, 504),
-		cslb.WithUpstream("http://codes.local",
-			cslb.Backend(ratelimited.URL),
-			cslb.Backend(normal.URL),
+		cslb.WithUpstreams(
+			cslb.Upstream("http://codes.local",
+				cslb.Server(ratelimited.URL),
+				cslb.Server(normal.URL),
+			),
 		),
 	)
 	client := &http.Client{Transport: t1}
@@ -245,9 +249,11 @@ func Example_nextUpstreamCodes() {
 			// 429 rate-limited or 5xx server error -> retry
 			return resp.StatusCode == 429 || resp.StatusCode >= 500
 		}),
-		cslb.WithUpstream("http://custom.local",
-			cslb.Backend(ratelimited.URL),
-			cslb.Backend(normal.URL),
+		cslb.WithUpstreams(
+			cslb.Upstream("http://custom.local",
+				cslb.Server(ratelimited.URL),
+				cslb.Server(normal.URL),
+			),
 		),
 	)
 	client2 := &http.Client{Transport: t2}
@@ -277,9 +283,11 @@ func Example_httpToHttps() {
 	// Use the HTTPS backend's TLS client config to trust its certificate
 	transport := cslb.NewTransport(
 		cslb.WithRoundTripper(httpsBackend.Client().Transport),
-		cslb.WithUpstream("http://frontend.local",
-			// Frontend is HTTP, backend is HTTPS - scheme is automatically rewritten
-			cslb.Backend(httpsBackend.URL), // "https://127.0.0.1:xxx"
+		cslb.WithUpstreams(
+			cslb.Upstream("http://frontend.local",
+				// Frontend is HTTP, backend is HTTPS - scheme is automatically rewritten
+				cslb.Server(httpsBackend.URL), // "https://127.0.0.1:xxx"
+			),
 		),
 	)
 
@@ -312,9 +320,11 @@ func Example_mixedScheme() {
 	// Need a transport that can access both HTTP and trust the test certificate
 	transport := cslb.NewTransport(
 		cslb.WithRoundTripper(httpsBackend.Client().Transport),
-		cslb.WithUpstream("http://mixed.local",
-			cslb.Backend(httpBackend.URL),  // http://127.0.0.1:xxx
-			cslb.Backend(httpsBackend.URL), // https://127.0.0.1:yyy
+		cslb.WithUpstreams(
+			cslb.Upstream("http://mixed.local",
+				cslb.Server(httpBackend.URL),  // http://127.0.0.1:xxx
+				cslb.Server(httpsBackend.URL), // https://127.0.0.1:yyy
+			),
 		),
 	)
 
@@ -347,9 +357,11 @@ func Example_timeout() {
 
 	transport := cslb.NewTransport(
 		cslb.WithTimeout(500*time.Millisecond), // max 500ms per attempt
-		cslb.WithUpstream("http://timeout.local",
-			cslb.Backend(slow.URL), // will time out
-			cslb.Backend(fast.URL), // automatically falls back here
+		cslb.WithUpstreams(
+			cslb.Upstream("http://timeout.local",
+				cslb.Server(slow.URL), // will time out
+				cslb.Server(fast.URL), // automatically falls back here
+			),
 		),
 	)
 
@@ -388,8 +400,10 @@ func Example_customTransport() {
 
 	transport := cslb.NewTransport(
 		cslb.WithRoundTripper(customRT), // provide custom Transport
-		cslb.WithUpstream("http://custom-rt.local",
-			cslb.Backend(b.URL),
+		cslb.WithUpstreams(
+			cslb.Upstream("http://custom-rt.local",
+				cslb.Server(b.URL),
+			),
 		),
 	)
 
@@ -422,9 +436,11 @@ func Example_postBodyReplay() {
 	defer b.Close()
 
 	transport := cslb.NewTransport(
-		cslb.WithUpstream("http://post.local",
-			cslb.Backend(b.URL), // first attempt fails
-			cslb.Backend(b.URL), // body is automatically replayed on retry
+		cslb.WithUpstreams(
+			cslb.Upstream("http://post.local",
+				cslb.Server(b.URL), // first attempt fails
+				cslb.Server(b.URL), // body is automatically replayed on retry
+			),
 		),
 	)
 
@@ -456,8 +472,10 @@ func Example_maxBodyBuffer() {
 
 	transport := cslb.NewTransport(
 		cslb.WithMaxBodyBuffer(1<<20), // 1MB in-memory limit, larger bodies spill to temp file
-		cslb.WithUpstream("http://bigbody.local",
-			cslb.Backend(b.URL),
+		cslb.WithUpstreams(
+			cslb.Upstream("http://bigbody.local",
+				cslb.Server(b.URL),
+			),
 		),
 	)
 
@@ -487,8 +505,10 @@ func Example_hostHeaderPreserved() {
 	defer b.Close()
 
 	transport := cslb.NewTransport(
-		cslb.WithUpstream("http://preserve-host.local",
-			cslb.Backend(b.URL),
+		cslb.WithUpstreams(
+			cslb.Upstream("http://preserve-host.local",
+				cslb.Server(b.URL),
+			),
 		),
 	)
 
@@ -515,8 +535,10 @@ func Example_passthrough() {
 
 	transport := cslb.NewTransport(
 		cslb.WithRoundTripper(http.DefaultTransport),
-		cslb.WithUpstream("http://registered.local",
-			cslb.Backend(b.URL),
+		cslb.WithUpstreams(
+			cslb.Upstream("http://registered.local",
+				cslb.Server(b.URL),
+			),
 		),
 	)
 
@@ -550,11 +572,11 @@ func Example_proxySSLName() {
 
 	transport := cslb.NewTransport(
 		cslb.WithRoundTripper(testTransport),
-		cslb.WithUpstream("https://api.example.com",
-			// Backend is an IP address — without ProxySSLName, SNI would be the IP
-			cslb.Backend(backend.URL),
-			// Override SNI to the desired hostname
-			cslb.ProxySSLName("api.example.com"),
+		cslb.WithUpstreams(
+			cslb.Upstream("https://api.example.com",
+				// Backend is an IP address — without ProxySSLName, SNI would be the IP
+				cslb.Server(backend.URL),
+			).ProxySSLName("api.example.com"), // Override SNI to the desired hostname
 		),
 	)
 
@@ -571,7 +593,7 @@ func Example_proxySSLName() {
 // ----------------------------------------------------------------
 // Example 15: Hash by cookie for session affinity
 // ----------------------------------------------------------------
-// UseHash's keyFunc can extract any request attribute as the hash key.
+// Upstream.Hash can extract any request attribute as the hash key.
 // Common use cases: route by Cookie, Header, or query parameter for session affinity.
 func Example_hashByCookie() {
 	b1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -584,10 +606,11 @@ func Example_hashByCookie() {
 	defer b2.Close()
 
 	transport := cslb.NewTransport(
-		cslb.WithUpstream("http://session.local",
-			cslb.Backend(b1.URL),
-			cslb.Backend(b2.URL),
-			cslb.UseHash(func(r *http.Request) string {
+		cslb.WithUpstreams(
+			cslb.Upstream("http://session.local",
+				cslb.Server(b1.URL),
+				cslb.Server(b2.URL),
+			).Hash(func(r *http.Request) string {
 				// Hash by session cookie for session affinity
 				if c, err := r.Cookie("session_id"); err == nil {
 					return c.Value

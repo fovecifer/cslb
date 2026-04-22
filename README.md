@@ -1,6 +1,6 @@
 # cslb — Client Side Load Balance
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/fovecifer/cslb.svg)](https://pkg.go.dev/github.com/fovecifer/cslb)
+[![Go Reference](https://pkg.go.dev/badge/github.com/fovecifer/cslb/v2.svg)](https://pkg.go.dev/github.com/fovecifer/cslb/v2)
 
 `cslb` is a Go library that implements client-side load balancing as an `http.RoundTripper`.
 It intercepts outgoing HTTP requests, selects a backend using a load balancing algorithm,
@@ -19,13 +19,13 @@ All algorithms faithfully follow **nginx**'s upstream implementation.
 - **Per-attempt timeout** — each backend attempt gets its own timeout
 - **Scheme rewriting** — HTTP frontend can route to HTTPS backends (or mixed)
 - **Host header preservation** — original Host is preserved when rewriting
-- **Options pattern** — clean three-level configuration: Transport, Upstream, Backend
+- **Nginx-style config hierarchy** — explicit `Upstream` and `Server` blocks
 - **Zero dependencies** — only the Go standard library
 
 ## Install
 
 ```
-go get github.com/fovecifer/cslb
+go get github.com/fovecifer/cslb/v2
 ```
 
 ## Quick Start
@@ -38,19 +38,23 @@ import (
     "net/http"
     "time"
 
-    "github.com/fovecifer/cslb"
+    "github.com/fovecifer/cslb/v2"
 )
 
 func main() {
-    transport := cslb.NewTransport(
-        cslb.WithUpstream("http://api.example.com",
-            cslb.Backend("http://10.0.0.1:8080", cslb.Weight(5)),
-            cslb.Backend("http://10.0.0.2:8080", cslb.Weight(3)),
-            cslb.Backend("http://10.0.0.3:8080", cslb.AsBackup()),
-            cslb.UseLeastConn(),
+    transport, err := cslb.NewTransportE(
+        cslb.WithUpstreams(
+            cslb.Upstream("http://api.example.com",
+                cslb.Server("http://10.0.0.1:8080", cslb.Weight(5)),
+                cslb.Server("http://10.0.0.2:8080", cslb.Weight(3)),
+                cslb.Server("http://10.0.0.3:8080", cslb.Backup()),
+            ).LeastConn(),
         ),
         cslb.WithTimeout(5*time.Second),
     )
+    if err != nil {
+        panic(err)
+    }
 
     client := &http.Client{Transport: transport}
 
@@ -65,19 +69,22 @@ func main() {
 }
 ```
 
-If you want configuration validation during construction instead of deferred
-errors at request time, use `NewTransportE(...)` and handle the returned error.
+`WithUpstreams(...)` is the primary configuration API. It cleanly separates
+upstream-level and server-level configuration, similar to nginx's
+`upstream { server ...; }` blocks.
+For fail-fast validation during construction, use `NewTransportE(...)` and
+handle the returned error.
 
 ## Algorithms
 
 | Algorithm | Constructor | Description |
 |-----------|-------------|-------------|
-| Round-Robin | `UseRoundRobin()` | Smooth weighted round-robin (default) |
-| Least-Conn | `UseLeastConn()` | Routes to the peer with fewest active connections |
-| IP-Hash | `UseIPHash()` | Consistent hashing by client IP (uses /24 subnet for IPv4) |
-| Key-Hash | `UseHash(keyFunc)` | CRC32-based hash on an arbitrary request key |
-| Random | `UseRandom()` | Weighted random selection |
-| Random-Two | `UseRandomTwo()` | Power of Two Choices — picks the less loaded of two random peers |
+| Round-Robin | `.RoundRobin()` | Smooth weighted round-robin (default) |
+| Least-Conn | `.LeastConn()` | Routes to the peer with fewest active connections |
+| IP-Hash | `.IPHash()` | Consistent hashing by client IP (uses /24 subnet for IPv4) |
+| Key-Hash | `.Hash(keyFunc)` | CRC32-based hash on an arbitrary request key |
+| Random | `.Random()` | Weighted random selection |
+| Random-Two | `.RandomTwo()` | Power of Two Choices — picks the less loaded of two random peers |
 
 ## Configuration
 
@@ -85,7 +92,7 @@ errors at request time, use `NewTransportE(...)` and handle the returned error.
 
 | Option | Description |
 |--------|-------------|
-| `WithUpstream(pattern, opts...)` | Register an upstream group matched by scheme+host |
+| `WithUpstreams(upstream...)` | Register explicit nginx-style upstream blocks |
 | `WithRoundTripper(rt)` | Use a custom `http.RoundTripper` as the underlying transport |
 | `WithTimeout(d)` | Per-attempt request timeout |
 | `WithConnectTimeout(d)` | TCP connect timeout (ignored with custom RoundTripper) |
@@ -93,16 +100,32 @@ errors at request time, use `NewTransportE(...)` and handle the returned error.
 | `WithNextUpstream(cond)` | Custom retry condition function |
 | `WithNextUpstreamCodes(codes...)` | Retry on specific HTTP status codes |
 
-### Backend Options
+### Upstream / Server API
+
+```go
+cslb.WithUpstreams(
+    cslb.Upstream("http://api.example.com",
+        cslb.Server("http://10.0.0.1:8080", cslb.Weight(5)),
+        cslb.Server("http://10.0.0.2:8080", cslb.Weight(3)),
+        cslb.Server("http://10.0.0.3:8080", cslb.Backup()),
+    ).LeastConn(),
+)
+```
+
+`Upstream(...)` groups `Server(...)` entries together so algorithm selection,
+hashing, and SNI overrides live at the upstream level instead of being mixed
+into the same variadic option list as individual backends.
+
+### Server Options
 
 | Option | Description |
 |--------|-------------|
 | `Weight(w)` | Selection weight (default 1) |
 | `MaxFails(n)` | Failures before temporarily disabling (default 1) |
-| `FailTimeout(d)` | Duration a failed backend stays disabled (default 10s) |
+| `FailTimeout(d)` | Duration a failed server stays disabled (default 10s) |
 | `MaxConns(n)` | Max concurrent connections (0 = unlimited) |
-| `AsBackup()` | Only used when all primary backends are unavailable |
-| `AsDown()` | Initially marked as down |
+| `Backup()` | Only used when all primary backends are unavailable |
+| `Down()` | Initially marked as down |
 
 ## Retry Conditions
 

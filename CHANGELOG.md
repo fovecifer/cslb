@@ -7,13 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [v2.0.0] - 2026-04-22
+
 ### Changed
 
 - Removed constructor-time `panic` paths from transport configuration.
 - Added `NewTransportE` and `Transport.Err()` so invalid configuration can be
   reported as regular errors instead of crashing the caller.
+- Replaced the old upstream/backend option-style configuration with explicit
+  `WithUpstreams` / `Upstream` / `Server` APIs so upstream-level and
+  server-level settings are separated more clearly, closer to nginx's
+  `upstream { server ...; }` structure.
+- Bumped the Go module path to `github.com/fovecifer/cslb/v2` for the breaking
+  API release.
 - Hardened public helpers and `RoundTrip` against nil inputs and invalid
   `RoundTripper` implementations that previously could trigger runtime panics.
+
+### Removed
+
+- Removed the old `WithUpstream` / `Backend` / `Use*` configuration entrypoints
+  in favor of the explicit upstream/server API.
 
 ## [v1.1.0] - 2026-03-22
 
@@ -37,5 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Backend options: `Weight`, `MaxFails`, `FailTimeout`, `MaxConns`, `AsBackup`, `AsDown`.
 - Standalone `PickOne` and `PickWithRetry` helpers for non-HTTP use cases.
 
+[Unreleased]: https://github.com/fovecifer/cslb/compare/v2.0.0...HEAD
+[v2.0.0]: https://github.com/fovecifer/cslb/compare/v1.1.0...v2.0.0
 [v1.1.0]: https://github.com/fovecifer/cslb/compare/v1.0.0...v1.1.0
 [v1.0.0]: https://github.com/fovecifer/cslb/releases/tag/v1.0.0

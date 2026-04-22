@@ -38,10 +38,12 @@ func TestTransport_RoundRobinDistribution(t *testing.T) {
 	}
 
 	tr := NewTransport(
-		WithUpstream("http://myservice.local",
-			Backend(servers[0].URL, Weight(5)),
-			Backend(servers[1].URL, Weight(3)),
-			Backend(servers[2].URL, Weight(2)),
+		WithUpstreams(
+			Upstream("http://myservice.local",
+				Server(servers[0].URL, Weight(5)),
+				Server(servers[1].URL, Weight(3)),
+				Server(servers[2].URL, Weight(2)),
+			),
 		),
 	)
 	client := &http.Client{Transport: tr}
@@ -71,8 +73,10 @@ func TestTransport_NoUpstreamPassthrough(t *testing.T) {
 
 	tr := NewTransport(
 		WithRoundTripper(http.DefaultTransport),
-		WithUpstream("http://other.local",
-			Backend(backend.URL),
+		WithUpstreams(
+			Upstream("http://other.local",
+				Server(backend.URL),
+			),
 		),
 	)
 	client := &http.Client{Transport: tr}
@@ -103,9 +107,11 @@ func TestTransport_FailoverToNextPeer(t *testing.T) {
 	defer good.Close()
 
 	tr := NewTransport(
-		WithUpstream("http://failover.local",
-			Backend(bad.URL),
-			Backend(good.URL),
+		WithUpstreams(
+			Upstream("http://failover.local",
+				Server(bad.URL),
+				Server(good.URL),
+			),
 		),
 	)
 	client := &http.Client{Transport: tr}
@@ -134,9 +140,11 @@ func TestTransport_BackupFallback(t *testing.T) {
 	defer backup.Close()
 
 	tr := NewTransport(
-		WithUpstream("http://backup.local",
-			Backend(primary.URL),
-			Backend(backup.URL, AsBackup()),
+		WithUpstreams(
+			Upstream("http://backup.local",
+				Server(primary.URL),
+				Server(backup.URL, Backup()),
+			),
 		),
 	)
 	client := &http.Client{Transport: tr}
@@ -162,8 +170,10 @@ func TestTransport_HostHeaderPreserved(t *testing.T) {
 	defer backend.Close()
 
 	tr := NewTransport(
-		WithUpstream("http://original-host.com",
-			Backend(backend.URL),
+		WithUpstreams(
+			Upstream("http://original-host.com",
+				Server(backend.URL),
+			),
 		),
 	)
 	client := &http.Client{Transport: tr}
@@ -206,9 +216,11 @@ func TestTransport_PostBodyRetried(t *testing.T) {
 
 	// Two backends pointing to the same server to test retry with body replay
 	tr := NewTransport(
-		WithUpstream("http://post.local",
-			Backend(backend.URL),
-			Backend(backend.URL),
+		WithUpstreams(
+			Upstream("http://post.local",
+				Server(backend.URL),
+				Server(backend.URL),
+			),
 		),
 	)
 	client := &http.Client{Transport: tr}
@@ -244,10 +256,11 @@ func TestTransport_LeastConn(t *testing.T) {
 	}
 
 	tr := NewTransport(
-		WithUpstream("http://lc.local",
-			Backend(servers[0].URL),
-			Backend(servers[1].URL),
-			UseLeastConn(),
+		WithUpstreams(
+			Upstream("http://lc.local",
+				Server(servers[0].URL),
+				Server(servers[1].URL),
+			).LeastConn(),
 		),
 	)
 	client := &http.Client{Transport: tr}
@@ -280,11 +293,12 @@ func TestTransport_Hash(t *testing.T) {
 	}
 
 	tr := NewTransport(
-		WithUpstream("http://hash.local",
-			Backend(servers[0].URL),
-			Backend(servers[1].URL),
-			Backend(servers[2].URL),
-			UseHash(func(r *http.Request) string {
+		WithUpstreams(
+			Upstream("http://hash.local",
+				Server(servers[0].URL),
+				Server(servers[1].URL),
+				Server(servers[2].URL),
+			).Hash(func(r *http.Request) string {
 				return r.URL.Path
 			}),
 		),
@@ -323,9 +337,11 @@ func TestTransport_Timeout(t *testing.T) {
 
 	tr := NewTransport(
 		WithTimeout(500*time.Millisecond),
-		WithUpstream("http://timeout.local",
-			Backend(slow.URL),
-			Backend(fast.URL),
+		WithUpstreams(
+			Upstream("http://timeout.local",
+				Server(slow.URL),
+				Server(fast.URL),
+			),
 		),
 	)
 	client := &http.Client{Transport: tr}
@@ -352,8 +368,10 @@ func TestTransport_BackendSchemeInherited(t *testing.T) {
 	addr := strings.TrimPrefix(backend.URL, "http://")
 
 	tr := NewTransport(
-		WithUpstream("http://inherit.local",
-			Backend(addr), // no scheme — should inherit "http"
+		WithUpstreams(
+			Upstream("http://inherit.local",
+				Server(addr), // no scheme — should inherit "http"
+			),
 		),
 	)
 	client := &http.Client{Transport: tr}
@@ -387,9 +405,11 @@ func TestTransport_NextUpstreamCodes(t *testing.T) {
 
 	// Default behavior: 403 is NOT retried (only 5xx)
 	tr := NewTransport(
-		WithUpstream("http://default.local",
-			Backend(b1.URL),
-			Backend(b2.URL),
+		WithUpstreams(
+			Upstream("http://default.local",
+				Server(b1.URL),
+				Server(b2.URL),
+			),
 		),
 	)
 	client := &http.Client{Transport: tr}
@@ -407,9 +427,11 @@ func TestTransport_NextUpstreamCodes(t *testing.T) {
 	// With 403 configured as retry code
 	tr2 := NewTransport(
 		WithNextUpstreamCodes(403, 502, 503, 504),
-		WithUpstream("http://custom.local",
-			Backend(b1.URL),
-			Backend(b2.URL),
+		WithUpstreams(
+			Upstream("http://custom.local",
+				Server(b1.URL),
+				Server(b2.URL),
+			),
 		),
 	)
 	client2 := &http.Client{Transport: tr2}
@@ -445,9 +467,11 @@ func TestTransport_NextUpstreamCustomCondition(t *testing.T) {
 			// Retry on 429 (rate limited) and 5xx
 			return resp.StatusCode == 429 || resp.StatusCode >= 500
 		}),
-		WithUpstream("http://cond.local",
-			Backend(b1.URL),
-			Backend(b2.URL),
+		WithUpstreams(
+			Upstream("http://cond.local",
+				Server(b1.URL),
+				Server(b2.URL),
+			),
 		),
 	)
 	client := &http.Client{Transport: tr}
@@ -473,9 +497,11 @@ func TestTransport_NextUpstreamCodesNoRetry(t *testing.T) {
 
 	tr := NewTransport(
 		WithNextUpstreamCodes(502, 503), // 500 is NOT in the list
-		WithUpstream("http://noskip.local",
-			Backend(b.URL),
-			Backend(b.URL),
+		WithUpstreams(
+			Upstream("http://noskip.local",
+				Server(b.URL),
+				Server(b.URL),
+			),
 		),
 	)
 	client := &http.Client{Transport: tr}
@@ -547,17 +573,17 @@ func TestOptions_FailTimeout(t *testing.T) {
 	}
 }
 
-func TestOptions_AsBackup(t *testing.T) {
+func TestOptions_Backup(t *testing.T) {
 	p := &Peer{}
-	AsBackup()(p)
+	Backup()(p)
 	if !p.Backup {
 		t.Error("Backup should be true")
 	}
 }
 
-func TestOptions_AsDown(t *testing.T) {
+func TestOptions_Down(t *testing.T) {
 	p := &Peer{}
-	AsDown()(p)
+	Down()(p)
 	if !p.Down {
 		t.Error("Down should be true")
 	}
@@ -586,9 +612,10 @@ func TestTransport_ProxySSLName(t *testing.T) {
 
 	transport := NewTransport(
 		WithRoundTripper(baseRT),
-		WithUpstream("https://myservice.local",
-			Backend(backend.Listener.Addr().String()),
-			ProxySSLName("custom-sni.example.com"),
+		WithUpstreams(
+			Upstream("https://myservice.local",
+				Server(backend.Listener.Addr().String()),
+			).ProxySSLName("custom-sni.example.com"),
 		),
 	)
 
@@ -609,9 +636,10 @@ func TestTransport_ProxySSLName(t *testing.T) {
 func TestTransport_ProxySSLName_DefaultTransport(t *testing.T) {
 	// Verify ProxySSLName works with the default transport (no WithRoundTripper)
 	transport := NewTransport(
-		WithUpstream("https://ssl.local",
-			Backend("https://10.0.0.1:443"),
-			ProxySSLName("ssl.example.com"),
+		WithUpstreams(
+			Upstream("https://ssl.local",
+				Server("https://10.0.0.1:443"),
+			).ProxySSLName("ssl.example.com"),
 		),
 	)
 
@@ -643,8 +671,10 @@ func TestTransport_ProxySSLName_DefaultTransport(t *testing.T) {
 
 func TestNewTransportE_InvalidUpstreamPattern(t *testing.T) {
 	_, err := NewTransportE(
-		WithUpstream("not-a-valid-upstream",
-			Backend("http://127.0.0.1:8080"),
+		WithUpstreams(
+			Upstream("not-a-valid-upstream",
+				Server("http://127.0.0.1:8080"),
+			),
 		),
 	)
 	if err == nil {
@@ -655,25 +685,28 @@ func TestNewTransportE_InvalidUpstreamPattern(t *testing.T) {
 	}
 }
 
-func TestNewTransportE_InvalidBackendAddress(t *testing.T) {
+func TestNewTransportE_WithUpstreams_InvalidServerAddress(t *testing.T) {
 	_, err := NewTransportE(
-		WithUpstream("http://service.local",
-			Backend("http://"),
+		WithUpstreams(
+			Upstream("http://service.local",
+				Server("http://"),
+			),
 		),
 	)
 	if err == nil {
-		t.Fatal("expected error for invalid backend address")
+		t.Fatal("expected error for invalid server address")
 	}
 	if !strings.Contains(err.Error(), `invalid backend address: "http://"`) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
-func TestNewTransportE_HashRequiresKeyFunc(t *testing.T) {
+func TestNewTransportE_WithUpstreams_HashRequiresKeyFunc(t *testing.T) {
 	_, err := NewTransportE(
-		WithUpstream("http://hash.local",
-			Backend("http://127.0.0.1:8080"),
-			UseHash(nil),
+		WithUpstreams(
+			Upstream("http://hash.local",
+				Server("http://127.0.0.1:8080"),
+			).Hash(nil),
 		),
 	)
 	if err == nil {
@@ -693,9 +726,10 @@ func TestNewTransportE_ProxySSLNameRequiresHTTPTransport(t *testing.T) {
 				Request:    req,
 			}, nil
 		})),
-		WithUpstream("https://ssl.local",
-			Backend("https://10.0.0.1:443"),
-			ProxySSLName("ssl.example.com"),
+		WithUpstreams(
+			Upstream("https://ssl.local",
+				Server("https://10.0.0.1:443"),
+			).ProxySSLName("ssl.example.com"),
 		),
 	)
 	if err == nil {
@@ -706,10 +740,12 @@ func TestNewTransportE_ProxySSLNameRequiresHTTPTransport(t *testing.T) {
 	}
 }
 
-func TestNewTransport_BackwardCompatibleInitError(t *testing.T) {
+func TestNewTransport_InitError(t *testing.T) {
 	transport := NewTransport(
-		WithUpstream("not-a-valid-upstream",
-			Backend("http://127.0.0.1:8080"),
+		WithUpstreams(
+			Upstream("not-a-valid-upstream",
+				Server("http://127.0.0.1:8080"),
+			),
 		),
 	)
 

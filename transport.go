@@ -87,6 +87,31 @@ const (
 // TransportOption configures a Transport.
 type TransportOption func(*Transport)
 
+// ServerOption configures a backend server inside an Upstream.
+type ServerOption func(*Peer)
+
+// ServerConfig defines one backend server within an upstream group.
+// It maps closely to nginx's `server ...` entries inside an `upstream` block.
+type ServerConfig struct {
+	Address     string
+	Weight      int
+	Down        bool
+	MaxConns    int
+	MaxFails    int
+	FailTimeout time.Duration
+	Backup      bool
+}
+
+// UpstreamConfig defines one upstream group and the servers behind it.
+// It maps closely to nginx's `upstream ... { server ...; }` structure.
+type UpstreamConfig struct {
+	Pattern   string
+	Servers   []ServerConfig
+	Algorithm AlgorithmType
+	HashFunc  func(*http.Request) string
+	SSLName   string
+}
+
 // upstreamConfig collects configuration before building an upstream.
 type upstreamConfig struct {
 	defaultScheme string
@@ -98,27 +123,96 @@ type upstreamConfig struct {
 	err           error
 }
 
-// UpstreamOption configures an upstream group.
-type UpstreamOption func(*upstreamConfig)
+// Upstream creates an explicit upstream configuration block.
+func Upstream(pattern string, servers ...ServerConfig) UpstreamConfig {
+	return UpstreamConfig{
+		Pattern: pattern,
+		Servers: append([]ServerConfig(nil), servers...),
+	}
+}
 
-// BackendOption configures a backend peer.
-type BackendOption func(*Peer)
+// Server creates an explicit backend server entry for use inside Upstream.
+func Server(addr string, opts ...ServerOption) ServerConfig {
+	peer := &Peer{Addr: addr}
+	for _, opt := range opts {
+		opt(peer)
+	}
+
+	return ServerConfig{
+		Address:     addr,
+		Weight:      peer.Weight,
+		Down:        peer.Down,
+		MaxConns:    peer.MaxConns,
+		MaxFails:    peer.MaxFails,
+		FailTimeout: peer.FailTimeout,
+		Backup:      peer.Backup,
+	}
+}
+
+// RoundRobin selects smooth weighted round-robin for the upstream.
+func (u UpstreamConfig) RoundRobin() UpstreamConfig {
+	u.Algorithm = AlgoRoundRobin
+	u.HashFunc = nil
+	return u
+}
+
+// LeastConn selects least-connections for the upstream.
+func (u UpstreamConfig) LeastConn() UpstreamConfig {
+	u.Algorithm = AlgoLeastConn
+	u.HashFunc = nil
+	return u
+}
+
+// IPHash selects IP-hash for the upstream.
+func (u UpstreamConfig) IPHash() UpstreamConfig {
+	u.Algorithm = AlgoIPHash
+	u.HashFunc = nil
+	return u
+}
+
+// Hash selects key-based hash for the upstream.
+func (u UpstreamConfig) Hash(keyFunc func(*http.Request) string) UpstreamConfig {
+	u.Algorithm = AlgoHash
+	u.HashFunc = keyFunc
+	return u
+}
+
+// Random selects weighted random for the upstream.
+func (u UpstreamConfig) Random() UpstreamConfig {
+	u.Algorithm = AlgoRandom
+	u.HashFunc = nil
+	return u
+}
+
+// RandomTwo selects the Power of Two Choices algorithm for the upstream.
+func (u UpstreamConfig) RandomTwo() UpstreamConfig {
+	u.Algorithm = AlgoRandomTwo
+	u.HashFunc = nil
+	return u
+}
+
+// ProxySSLName sets the TLS SNI override for the upstream.
+func (u UpstreamConfig) ProxySSLName(name string) UpstreamConfig {
+	u.SSLName = name
+	return u
+}
 
 // ---------- Constructor ----------
 
 // NewTransport creates a new load-balancing transport with the given options.
 // Invalid configuration is retained on the returned transport and surfaced
-// through Err() / RoundTrip() for backward compatibility. Use NewTransportE
+// through Err() / RoundTrip(). Use NewTransportE
 // to fail fast with an immediate error.
 //
 // Usage:
 //
 //	transport := cslb.NewTransport(
-//	    cslb.WithUpstream("http://api.example.com",
-//	        cslb.Backend("http://10.0.0.1:8080", cslb.Weight(5)),
-//	        cslb.Backend("http://10.0.0.2:8080", cslb.Weight(3)),
-//	        cslb.Backend("http://10.0.0.3:8080", cslb.AsBackup()),
-//	        cslb.UseLeastConn(),
+//	    cslb.WithUpstreams(
+//	        cslb.Upstream("http://api.example.com",
+//	            cslb.Server("http://10.0.0.1:8080", cslb.Weight(5)),
+//	            cslb.Server("http://10.0.0.2:8080", cslb.Weight(3)),
+//	            cslb.Server("http://10.0.0.3:8080", cslb.Backup()),
+//	        ).LeastConn(),
 //	    ),
 //	    cslb.WithTimeout(5*time.Second),
 //	    cslb.WithConnectTimeout(3*time.Second),
@@ -282,195 +376,180 @@ func WithNextUpstreamCodes(codes ...int) TransportOption {
 	})
 }
 
-// WithUpstream registers an upstream group. The pattern is a URL like
-// "http://api.example.com" that incoming requests are matched against by
-// scheme and host. When matched, the request is rewritten to one of the
-// configured backends.
-func WithUpstream(pattern string, opts ...UpstreamOption) TransportOption {
-	return func(t *Transport) {
-		u, err := url.Parse(pattern)
-		if err != nil || u.Scheme == "" || u.Host == "" {
-			t.addInitError(fmt.Errorf("cslb: invalid upstream pattern: %q", pattern))
-			return
-		}
-		key := upstreamKey{scheme: u.Scheme, host: u.Host}
-
-		cfg := &upstreamConfig{
-			defaultScheme: u.Scheme,
-			addrs:         make(map[*Peer]*backendAddr),
-		}
-		for _, opt := range opts {
-			opt(cfg)
-		}
-		if cfg.err != nil {
-			t.addInitError(fmt.Errorf("cslb: upstream %q: %w", pattern, cfg.err))
-			return
-		}
-		if len(cfg.peers) == 0 {
-			t.addInitError(fmt.Errorf("cslb: upstream %q has no backends", pattern))
-			return
-		}
-
-		// Build balancer based on algorithm
-		var b Balancer
-		switch cfg.algo {
-		case AlgoLeastConn:
-			b = NewLeastConn(cfg.peers)
-		case AlgoIPHash:
-			b = NewIPHash(cfg.peers)
-		case AlgoHash:
-			b = NewHash(cfg.peers)
-		case AlgoRandom:
-			b = NewRandom(cfg.peers)
-		case AlgoRandomTwo:
-			b = NewRandomTwo(cfg.peers)
-		default:
-			b = NewRoundRobin(cfg.peers)
-		}
-
-		t.upstreams[key] = &upstream{
-			balancer: b,
-			backends: cfg.addrs,
-			hashFunc: cfg.hashFunc,
-			algo:     cfg.algo,
-			sslName:  cfg.sslName,
-		}
-	}
-}
-
-// ---------- Upstream options ----------
-
-// Backend adds a backend server to the upstream group. The addr is a URL like
-// "http://10.0.0.1:8080". If the scheme is omitted (e.g., "10.0.0.1:8080"),
-// it inherits from the upstream pattern.
-func Backend(addr string, opts ...BackendOption) UpstreamOption {
-	return func(cfg *upstreamConfig) {
-		if addr == "" {
-			cfg.addError(errors.New("cslb: backend address must not be empty"))
-			return
-		}
-
-		scheme := cfg.defaultScheme
-		host := addr
-
-		if strings.Contains(addr, "://") {
-			u, err := url.Parse(addr)
-			if err != nil || u.Scheme == "" || u.Host == "" {
-				cfg.addError(fmt.Errorf("cslb: invalid backend address: %q", addr))
-				return
-			}
-			scheme = u.Scheme
-			host = u.Host
-		}
-		if host == "" {
-			cfg.addError(fmt.Errorf("cslb: invalid backend address: %q", addr))
-			return
-		}
-
-		p := &Peer{Addr: addr}
-		for _, opt := range opts {
-			opt(p)
-		}
-
-		cfg.peers = append(cfg.peers, p)
-		cfg.addrs[p] = &backendAddr{scheme: scheme, host: host}
-	}
-}
-
-// UseRoundRobin selects smooth weighted round-robin (default).
-func UseRoundRobin() UpstreamOption {
-	return func(cfg *upstreamConfig) { cfg.algo = AlgoRoundRobin }
-}
-
-// UseLeastConn selects least-connections algorithm.
-func UseLeastConn() UpstreamOption {
-	return func(cfg *upstreamConfig) { cfg.algo = AlgoLeastConn }
-}
-
-// UseIPHash selects IP-hash algorithm. Client IP is extracted from
-// X-Real-IP, X-Forwarded-For, or RemoteAddr.
-func UseIPHash() UpstreamOption {
-	return func(cfg *upstreamConfig) { cfg.algo = AlgoIPHash }
-}
-
-// UseHash selects key-based hash algorithm. The keyFunc extracts a hash key
-// from each request (e.g., URI path, cookie value, header).
-func UseHash(keyFunc func(*http.Request) string) UpstreamOption {
-	return func(cfg *upstreamConfig) {
-		cfg.algo = AlgoHash
-		if keyFunc == nil {
-			cfg.addError(errors.New("cslb: hash key function must not be nil"))
-			return
-		}
-		cfg.hashFunc = keyFunc
-	}
-}
-
-// UseRandom selects random algorithm.
-func UseRandom() UpstreamOption {
-	return func(cfg *upstreamConfig) { cfg.algo = AlgoRandom }
-}
-
-// UseRandomTwo selects random-two (Power of Two Choices) algorithm.
-func UseRandomTwo() UpstreamOption {
-	return func(cfg *upstreamConfig) { cfg.algo = AlgoRandomTwo }
-}
-
-// ProxySSLName sets the server name used for SNI (Server Name Indication)
-// in TLS handshakes with backend servers. This corresponds to nginx's
-// proxy_ssl_name directive combined with proxy_ssl_server_name on.
+// WithUpstreams registers one or more explicit upstream blocks.
+// This is the recommended API when you want nginx-style readability:
 //
-// When backends are addressed by IP (e.g., "https://10.0.0.1:443"), TLS
-// handshakes normally send the IP as SNI, which breaks SNI-based routing
-// and certificate verification. ProxySSLName overrides the SNI to the
-// specified hostname.
-//
-// Only works with the default transport or a custom *http.Transport
-// provided via WithRoundTripper. The transport is cloned per-upstream
-// so the override does not affect other upstream groups.
-//
-// Example:
-//
-//	cslb.WithUpstream("https://api.example.com",
-//	    cslb.Backend("https://10.0.0.1:443"),
-//	    cslb.Backend("https://10.0.0.2:443"),
-//	    cslb.ProxySSLName("api.example.com"),
+//	cslb.NewTransport(
+//	    cslb.WithUpstreams(
+//	        cslb.Upstream("http://api.example.com",
+//	            cslb.Server("http://10.0.0.1:8080", cslb.Weight(5)),
+//	            cslb.Server("http://10.0.0.2:8080", cslb.Weight(3)),
+//	            cslb.Server("http://10.0.0.3:8080", cslb.Backup()),
+//	        ).LeastConn(),
+//	    ),
 //	)
-func ProxySSLName(name string) UpstreamOption {
-	return func(cfg *upstreamConfig) { cfg.sslName = name }
+func WithUpstreams(upstreams ...UpstreamConfig) TransportOption {
+	return func(t *Transport) {
+		for _, upstream := range upstreams {
+			t.registerExplicitUpstream(upstream)
+		}
+	}
 }
 
-// ---------- Backend options ----------
+// ---------- Server options ----------
 
-// Weight sets the backend's weight. Higher weight means more traffic.
-func Weight(w int) BackendOption {
+// Weight sets the server's weight. Higher weight means more traffic.
+func Weight(w int) ServerOption {
 	return func(p *Peer) { p.Weight = w }
 }
 
-// MaxFails sets the number of failures before a backend is temporarily disabled.
-func MaxFails(n int) BackendOption {
+// MaxFails sets the number of failures before a server is temporarily disabled.
+func MaxFails(n int) ServerOption {
 	return func(p *Peer) { p.MaxFails = n }
 }
 
-// FailTimeout sets the duration a failed backend stays disabled.
-func FailTimeout(d time.Duration) BackendOption {
+// FailTimeout sets the duration a failed server stays disabled.
+func FailTimeout(d time.Duration) ServerOption {
 	return func(p *Peer) { p.FailTimeout = d }
 }
 
-// MaxConns sets the maximum concurrent connections to a backend.
-func MaxConns(n int) BackendOption {
+// MaxConns sets the maximum concurrent connections to a server.
+func MaxConns(n int) ServerOption {
 	return func(p *Peer) { p.MaxConns = n }
 }
 
-// AsBackup marks this backend as a backup server, only used when all
-// primary servers are unavailable.
-func AsBackup() BackendOption {
+// Backup marks a server as backup, only used when all primary servers fail.
+func Backup() ServerOption {
 	return func(p *Peer) { p.Backup = true }
 }
 
-// AsDown marks this backend as initially down.
-func AsDown() BackendOption {
+// Down marks a server as initially down.
+func Down() ServerOption {
 	return func(p *Peer) { p.Down = true }
+}
+
+func newUpstreamConfig(defaultScheme string) *upstreamConfig {
+	return &upstreamConfig{
+		defaultScheme: defaultScheme,
+		addrs:         make(map[*Peer]*backendAddr),
+	}
+}
+
+func (cfg *upstreamConfig) addPeer(peer *Peer, addr string) {
+	if addr == "" {
+		cfg.addError(errors.New("cslb: backend address must not be empty"))
+		return
+	}
+
+	scheme := cfg.defaultScheme
+	host := addr
+
+	if strings.Contains(addr, "://") {
+		u, err := url.Parse(addr)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			cfg.addError(fmt.Errorf("cslb: invalid backend address: %q", addr))
+			return
+		}
+		scheme = u.Scheme
+		host = u.Host
+	}
+	if host == "" {
+		cfg.addError(fmt.Errorf("cslb: invalid backend address: %q", addr))
+		return
+	}
+
+	cfg.peers = append(cfg.peers, peer)
+	cfg.addrs[peer] = &backendAddr{scheme: scheme, host: host}
+}
+
+func (cfg *upstreamConfig) normalize() {
+	if cfg.hashFunc != nil && cfg.algo == AlgoRoundRobin {
+		cfg.algo = AlgoHash
+	}
+	if cfg.hashFunc != nil && cfg.algo != AlgoHash {
+		cfg.addError(errors.New("cslb: hash key function can only be used with hash algorithm"))
+	}
+	if cfg.algo == AlgoHash && cfg.hashFunc == nil {
+		cfg.addError(errors.New("cslb: hash key function must not be nil"))
+	}
+}
+
+func (t *Transport) registerExplicitUpstream(upstream UpstreamConfig) {
+	cfg := newUpstreamConfig("")
+	cfg.algo = upstream.Algorithm
+	cfg.hashFunc = upstream.HashFunc
+	cfg.sslName = upstream.SSLName
+
+	for _, server := range upstream.Servers {
+		peer := &Peer{
+			Addr:        server.Address,
+			Weight:      server.Weight,
+			Down:        server.Down,
+			MaxConns:    server.MaxConns,
+			MaxFails:    server.MaxFails,
+			FailTimeout: server.FailTimeout,
+			Backup:      server.Backup,
+		}
+		cfg.addPeer(peer, server.Address)
+	}
+
+	t.registerUpstream(upstream.Pattern, cfg)
+}
+
+func (t *Transport) registerUpstream(pattern string, cfg *upstreamConfig) {
+	u, err := url.Parse(pattern)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		t.addInitError(fmt.Errorf("cslb: invalid upstream pattern: %q", pattern))
+		return
+	}
+
+	if cfg.defaultScheme == "" {
+		cfg.defaultScheme = u.Scheme
+		// Rebuild inherited backend schemes when explicit config was created before
+		// the upstream pattern was known.
+		for peer, addr := range cfg.addrs {
+			if strings.Contains(peer.Addr, "://") {
+				continue
+			}
+			addr.scheme = u.Scheme
+		}
+	}
+
+	cfg.normalize()
+	if cfg.err != nil {
+		t.addInitError(fmt.Errorf("cslb: upstream %q: %w", pattern, cfg.err))
+		return
+	}
+	if len(cfg.peers) == 0 {
+		t.addInitError(fmt.Errorf("cslb: upstream %q has no backends", pattern))
+		return
+	}
+
+	key := upstreamKey{scheme: u.Scheme, host: u.Host}
+	t.upstreams[key] = &upstream{
+		balancer: newBalancer(cfg.algo, cfg.peers),
+		backends: cfg.addrs,
+		hashFunc: cfg.hashFunc,
+		algo:     cfg.algo,
+		sslName:  cfg.sslName,
+	}
+}
+
+func newBalancer(algo AlgorithmType, peers []*Peer) Balancer {
+	switch algo {
+	case AlgoLeastConn:
+		return NewLeastConn(peers)
+	case AlgoIPHash:
+		return NewIPHash(peers)
+	case AlgoHash:
+		return NewHash(peers)
+	case AlgoRandom:
+		return NewRandom(peers)
+	case AlgoRandomTwo:
+		return NewRandomTwo(peers)
+	default:
+		return NewRoundRobin(peers)
+	}
 }
 
 // ---------- RoundTrip ----------

@@ -64,4 +64,8 @@ All algorithms wrap `RoundRobin` as a base layer, matching nginx's decorator pat
 
 ### Options pattern
 
-Three-level functional options: `TransportOption` → `UpstreamOption` → `BackendOption`. All are applied in `NewTransport`, which also clones per-upstream `*http.Transport` instances for upstreams that use `ProxySSLName`.
+Public configuration uses transport-level options plus an explicit nginx-style
+hierarchy: `WithUpstreams(...)` with `Upstream(...)` and `Server(...)`.
+All upstreams are normalized through the same registration path in
+`NewTransport`, which also clones per-upstream `*http.Transport` instances for
+upstreams that use `ProxySSLName`.
