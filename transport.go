@@ -767,7 +767,39 @@ func (t *Transport) prepareBody(req *http.Request) (getBody func() (io.ReadClose
 		initialBody := req.Body
 		startPos, err := seeker.Seek(0, io.SeekCurrent)
 		if err != nil {
+			initialBody.Close()
 			return nil, nil, err
+		}
+		// Best-effort: when SeekEnd works we know how many bytes will actually
+		// be read on each retry, and can both clamp a stale ContentLength and
+		// detect an at/past-EOF seeker. Leave -1 (chunked) or any value
+		// already <= remaining alone, so we do not change request framing or
+		// forward more bytes than the caller declared.
+		if endPos, seekErr := seeker.Seek(0, io.SeekEnd); seekErr == nil {
+			if _, err := seeker.Seek(startPos, io.SeekStart); err != nil {
+				initialBody.Close()
+				return nil, nil, err
+			}
+			remaining := endPos - startPos
+			if remaining < 0 {
+				remaining = 0
+			}
+			switch {
+			case remaining == 0 && req.ContentLength > 0:
+				// Stale positive ContentLength but body has nothing left.
+				// Hand back http.NoBody so net/http emits an explicit
+				// Content-Length: 0 instead of switching to chunked once the
+				// caller's positive value gets clamped to 0.
+				req.ContentLength = 0
+				return func() (io.ReadCloser, error) { return http.NoBody, nil },
+					func() { initialBody.Close() }, nil
+			case remaining > 0 && req.ContentLength > remaining:
+				// Caller's ContentLength was assuming the seeker started at 0;
+				// clamp down so we do not declare more bytes than we send.
+				req.ContentLength = remaining
+			}
+			// Otherwise (ContentLength == -1 chunked, or 0/positive already
+			// <= remaining) leave framing untouched.
 		}
 		return func() (io.ReadCloser, error) {
 			_, err := seeker.Seek(startPos, io.SeekStart)

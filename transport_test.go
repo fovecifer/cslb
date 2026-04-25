@@ -1,11 +1,13 @@
 package cslb
 
 import (
+	"bytes"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -837,5 +839,226 @@ func TestTransport_NoPeerAvailable(t *testing.T) {
 	_, err := tr.RoundTrip(req)
 	if err != ErrNoPeerAvailable {
 		t.Fatalf("got %v, want ErrNoPeerAvailable", err)
+	}
+}
+
+// readSeekCloser exposes both io.Seeker and io.ReadCloser without forcing
+// http.NewRequest to populate GetBody. This routes prepareBody into the
+// seeker fast-path instead of the buffered fallback.
+type readSeekCloser struct {
+	*bytes.Reader
+	closed bool
+}
+
+func (r *readSeekCloser) Close() error {
+	r.closed = true
+	return nil
+}
+
+func TestTransport_SeekerBodyContentLengthMatchesRemaining(t *testing.T) {
+	var gotLen atomic.Int64
+	var gotBody atomic.Value
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLen.Store(r.ContentLength)
+		b, _ := io.ReadAll(r.Body)
+		gotBody.Store(string(b))
+		w.WriteHeader(200)
+	}))
+	defer backend.Close()
+
+	tr := NewTransport(
+		WithUpstreams(
+			Upstream("http://seeker.local",
+				Server(backend.URL),
+			),
+		),
+	)
+
+	payload := []byte("hello world")
+	body := &readSeekCloser{Reader: bytes.NewReader(payload)}
+	if _, err := body.Seek(6, io.SeekStart); err != nil {
+		t.Fatalf("seek: %v", err)
+	}
+
+	u, _ := url.Parse("http://seeker.local/x")
+	req := &http.Request{
+		Method:        http.MethodPost,
+		URL:           u,
+		Body:          body,
+		ContentLength: int64(len(payload)), // intentionally the wrong value (full size, not remaining)
+		Host:          "seeker.local",
+		Header:        http.Header{},
+	}
+
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	resp.Body.Close()
+
+	if got := gotLen.Load(); got != 5 {
+		t.Errorf("backend ContentLength = %d, want 5", got)
+	}
+	if got, _ := gotBody.Load().(string); got != "world" {
+		t.Errorf("backend body = %q, want %q", got, "world")
+	}
+}
+
+func TestTransport_SeekerBodyAtEOFSendsExplicitEmptyBody(t *testing.T) {
+	// A seekable body positioned at EOF carries no bytes. The request must be
+	// framed as Content-Length: 0, not chunked, even when the caller left a
+	// stale positive ContentLength on the request.
+	var gotLen atomic.Int64
+	var gotTE atomic.Value
+	var gotBody atomic.Value
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLen.Store(r.ContentLength)
+		gotTE.Store(strings.Join(r.TransferEncoding, ","))
+		b, _ := io.ReadAll(r.Body)
+		gotBody.Store(string(b))
+		w.WriteHeader(200)
+	}))
+	defer backend.Close()
+
+	tr := NewTransport(
+		WithUpstreams(
+			Upstream("http://seeker-eof.local",
+				Server(backend.URL),
+			),
+		),
+	)
+
+	payload := []byte("hello")
+	body := &readSeekCloser{Reader: bytes.NewReader(payload)}
+	if _, err := body.Seek(0, io.SeekEnd); err != nil {
+		t.Fatalf("seek: %v", err)
+	}
+
+	u, _ := url.Parse("http://seeker-eof.local/x")
+	req := &http.Request{
+		Method:        http.MethodPost,
+		URL:           u,
+		Body:          body,
+		ContentLength: int64(len(payload)), // stale full size, no bytes actually remain
+		Host:          "seeker-eof.local",
+		Header:        http.Header{},
+	}
+
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	resp.Body.Close()
+
+	if got := gotLen.Load(); got != 0 {
+		t.Errorf("backend ContentLength = %d, want 0", got)
+	}
+	if got, _ := gotTE.Load().(string); got != "" {
+		t.Errorf("backend Transfer-Encoding = %q, want empty (fixed-length 0)", got)
+	}
+	if got, _ := gotBody.Load().(string); got != "" {
+		t.Errorf("backend body = %q, want empty", got)
+	}
+}
+
+func TestTransport_SeekerBodyChunkedAtEOFPreserved(t *testing.T) {
+	// Same chunked-preservation guarantee as the non-empty case: a caller who
+	// asked for chunked framing (ContentLength == -1) keeps it even when the
+	// seeker is already at EOF.
+	var gotLen atomic.Int64
+	var gotTE atomic.Value
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLen.Store(r.ContentLength)
+		gotTE.Store(strings.Join(r.TransferEncoding, ","))
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(200)
+	}))
+	defer backend.Close()
+
+	tr := NewTransport(
+		WithUpstreams(
+			Upstream("http://seeker-chunked-eof.local",
+				Server(backend.URL),
+			),
+		),
+	)
+
+	body := &readSeekCloser{Reader: bytes.NewReader([]byte("hello"))}
+	if _, err := body.Seek(0, io.SeekEnd); err != nil {
+		t.Fatalf("seek: %v", err)
+	}
+
+	u, _ := url.Parse("http://seeker-chunked-eof.local/x")
+	req := &http.Request{
+		Method:        http.MethodPost,
+		URL:           u,
+		Body:          body,
+		ContentLength: -1, // caller-requested chunked framing
+		Host:          "seeker-chunked-eof.local",
+		Header:        http.Header{},
+	}
+
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	resp.Body.Close()
+
+	if got := gotLen.Load(); got != -1 {
+		t.Errorf("backend ContentLength = %d, want -1 (chunked)", got)
+	}
+	if got, _ := gotTE.Load().(string); got != "chunked" {
+		t.Errorf("backend Transfer-Encoding = %q, want chunked", got)
+	}
+}
+
+func TestTransport_SeekerBodyChunkedContentLengthPreserved(t *testing.T) {
+	// ContentLength == -1 means the caller wants chunked transfer encoding.
+	// prepareBody must not silently switch the framing to Content-Length when
+	// it can measure the seeker's remaining size.
+	var gotLen atomic.Int64
+	var gotTE atomic.Value
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLen.Store(r.ContentLength)
+		gotTE.Store(strings.Join(r.TransferEncoding, ","))
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(200)
+	}))
+	defer backend.Close()
+
+	tr := NewTransport(
+		WithUpstreams(
+			Upstream("http://seeker-chunked.local",
+				Server(backend.URL),
+			),
+		),
+	)
+
+	body := &readSeekCloser{Reader: bytes.NewReader([]byte("hello"))}
+	u, _ := url.Parse("http://seeker-chunked.local/x")
+	req := &http.Request{
+		Method:        http.MethodPost,
+		URL:           u,
+		Body:          body,
+		ContentLength: -1, // caller-requested chunked framing
+		Host:          "seeker-chunked.local",
+		Header:        http.Header{},
+	}
+
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	resp.Body.Close()
+
+	if got := gotLen.Load(); got != -1 {
+		t.Errorf("backend ContentLength = %d, want -1 (chunked framing must be preserved)", got)
+	}
+	if got, _ := gotTE.Load().(string); got != "chunked" {
+		t.Errorf("backend Transfer-Encoding = %q, want %q", got, "chunked")
 	}
 }
