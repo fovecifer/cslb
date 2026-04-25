@@ -764,7 +764,12 @@ func (t *Transport) prepareBody(req *http.Request) (getBody func() (io.ReadClose
 
 	if f != nil {
 		// Spilled to file
-		stat, _ := f.Stat()
+		stat, err := f.Stat()
+		if err != nil {
+			f.Close()
+			os.Remove(f.Name())
+			return nil, nil, err
+		}
 		req.ContentLength = stat.Size()
 		return func() (io.ReadCloser, error) {
 				_, err := f.Seek(0, 0)
