@@ -785,3 +785,57 @@ func TestTransport_InvalidUnderlyingRoundTrip(t *testing.T) {
 		t.Fatalf("got %v, want %v", err, ErrInvalidRoundTrip)
 	}
 }
+
+func TestTransport_AllPeersFailReturnsLast(t *testing.T) {
+	// Both backends return 500. After exhausting retries the caller should
+	// see the last upstream's actual response (mirroring nginx's
+	// "last status wins" semantics in ngx_http_upstream_next).
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		w.Write([]byte("boom"))
+	}))
+	defer bad.Close()
+
+	tr := NewTransport(
+		WithUpstreams(
+			Upstream("http://allbad.local",
+				Server(bad.URL),
+				Server(bad.URL),
+			),
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Get("http://allbad.local/test")
+	if err != nil {
+		t.Fatalf("expected last upstream response, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 500 {
+		t.Errorf("status = %d, want 500", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "boom" {
+		t.Errorf("body = %q, want %q", body, "boom")
+	}
+}
+
+func TestTransport_NoPeerAvailable(t *testing.T) {
+	// All configured peers are marked Down — Pick() returns nil on the
+	// first attempt and we expect an explicit ErrNoPeerAvailable rather
+	// than a misleading DNS error from the upstream pattern host.
+	tr := NewTransport(
+		WithUpstreams(
+			Upstream("http://nopeer.local",
+				Server("http://10.0.0.1:1", Down()),
+			),
+		),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "http://nopeer.local/test", nil)
+	_, err := tr.RoundTrip(req)
+	if err != ErrNoPeerAvailable {
+		t.Fatalf("got %v, want ErrNoPeerAvailable", err)
+	}
+}

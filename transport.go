@@ -567,7 +567,9 @@ func (c *cancelCloser) Close() error {
 
 // RoundTrip implements http.RoundTripper. It matches the request against
 // configured upstreams, selects a backend, rewrites the URL, and forwards
-// the request. Failed attempts are retried on other backends.
+// the request. Failed attempts are retried on other backends. When all
+// peers are exhausted the last attempt's (resp, err) is returned;
+// when no peer is ever available, ErrNoPeerAvailable is returned.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if t == nil {
 		return nil, ErrNilRoundTripper
@@ -608,18 +610,38 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	reqCtx := req.Context()
 
+	// Carries the most recent attempt across iterations so that, when peers
+	// are exhausted, the caller sees the same (resp, err) the last upstream
+	// produced — mirroring nginx's ngx_http_upstream_next, which overwrites
+	// u->state->status on every retry and finalizes with whatever was last.
+	var lastResp *http.Response
+	var lastErr error
+	closeLast := func() {
+		if lastResp != nil {
+			lastResp.Body.Close()
+			lastResp = nil
+		}
+	}
+
 	for {
 		peer := pk.Pick()
 		if peer == nil {
-			// No more peers available, send to transport directly
-			return t.transport.RoundTrip(req)
+			if lastResp != nil || lastErr != nil {
+				return lastResp, lastErr
+			}
+			return nil, ErrNoPeerAvailable
 		}
 
 		addr := ups.backends[peer]
 		if addr == nil {
 			pk.Done(peer, true)
+			closeLast()
 			return nil, fmt.Errorf("cslb: selected peer %q has no backend address", peer.Addr)
 		}
+
+		// Committing to a new attempt — drop the previous failed attempt's body.
+		closeLast()
+		lastErr = nil
 
 		// Clone URL to avoid mutating shared state
 		u := *req.URL
@@ -680,10 +702,11 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return resp, err
 		}
 
-		// Close failed response body before retrying
-		if err == nil {
-			resp.Body.Close()
-		}
+		// Hold onto this attempt — it becomes the return value if the next
+		// Pick() turns up empty. The body is closed at the start of the next
+		// iteration, or by the caller if this is the last attempt.
+		lastResp = resp
+		lastErr = err
 	}
 }
 
