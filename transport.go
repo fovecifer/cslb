@@ -606,14 +606,16 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return t.roundTrip(t.transport, req)
 	}
 
+	baseReq := req.Clone(req.Context())
+
 	// Create picker based on algorithm
-	pk := t.newPicker(ups, req)
+	pk := t.newPicker(ups, baseReq)
 	if pk == nil {
 		return nil, ErrInvalidUpstreamConfig
 	}
 
 	// Prepare body for retries
-	getBody, cleanup, err := t.prepareBody(req)
+	getBody, cleanup, err := t.prepareBody(baseReq)
 	if err != nil {
 		return nil, err
 	}
@@ -656,18 +658,16 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		closeLast()
 		lastErr = nil
 
-		// Clone URL to avoid mutating shared state
-		u := *req.URL
-		req.URL = &u
+		attemptReq := baseReq.Clone(reqCtx)
 
 		// Preserve original Host header
-		if req.Host == "" {
-			req.Host = key.host
+		if attemptReq.Host == "" {
+			attemptReq.Host = key.host
 		}
 
 		// Rewrite to selected backend
-		req.URL.Scheme = addr.scheme
-		req.URL.Host = addr.host
+		attemptReq.URL.Scheme = addr.scheme
+		attemptReq.URL.Host = addr.host
 
 		// Restore body for this attempt
 		if getBody != nil {
@@ -676,8 +676,8 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 				pk.Done(peer, true)
 				return nil, err
 			}
-			req.Body = body
-			req.GetBody = getBody
+			attemptReq.Body = body
+			attemptReq.GetBody = getBody
 		}
 
 		// Apply per-attempt timeout
@@ -685,7 +685,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if t.timeout > 0 {
 			var ctx context.Context
 			ctx, cancel = context.WithTimeout(reqCtx, t.timeout)
-			req = req.WithContext(ctx)
+			attemptReq = attemptReq.WithContext(ctx)
 		}
 
 		// Use per-upstream transport (with custom SNI) if available
@@ -694,7 +694,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			rt = ups.transport
 		}
 
-		resp, err := t.roundTrip(rt, req)
+		resp, err := t.roundTrip(rt, attemptReq)
 
 		// Handle context cancellation
 		if err != nil {

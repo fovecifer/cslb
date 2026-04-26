@@ -20,6 +20,24 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+type trackingBody struct {
+	r      *strings.Reader
+	closed bool
+}
+
+func newTrackingBody(s string) *trackingBody {
+	return &trackingBody{r: strings.NewReader(s)}
+}
+
+func (b *trackingBody) Read(p []byte) (int, error) {
+	return b.r.Read(p)
+}
+
+func (b *trackingBody) Close() error {
+	b.closed = true
+	return nil
+}
+
 // ---------- Transport basic tests ----------
 
 func TestTransport_RoundRobinDistribution(t *testing.T) {
@@ -826,6 +844,147 @@ func TestTransport_InvalidUnderlyingRoundTrip(t *testing.T) {
 	_, err := transport.RoundTrip(req)
 	if err != ErrInvalidRoundTrip {
 		t.Fatalf("got %v, want %v", err, ErrInvalidRoundTrip)
+	}
+}
+
+func TestTransport_RoundTripDoesNotMutateOriginalRequest(t *testing.T) {
+	const payload = "payload"
+	originalBody := newTrackingBody(payload)
+	req, err := http.NewRequest(http.MethodPost, "http://immutable.local/path?x=1", originalBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalURL := req.URL
+	originalURLString := req.URL.String()
+	originalHost := req.Host
+	originalContentLength := req.ContentLength
+
+	var gotURL, gotHost, gotBody string
+	var gotContentLength int64
+	transport := NewTransport(
+		WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			gotURL = req.URL.String()
+			gotHost = req.Host
+			gotContentLength = req.ContentLength
+			if req.Body != nil {
+				b, _ := io.ReadAll(req.Body)
+				gotBody = string(b)
+				req.Body.Close()
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Request:    req,
+			}, nil
+		})),
+		WithUpstreams(
+			Upstream("http://immutable.local",
+				Server("http://127.0.0.1:8080"),
+			),
+		),
+	)
+
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	resp.Body.Close()
+
+	if gotURL != "http://127.0.0.1:8080/path?x=1" {
+		t.Fatalf("attempt URL = %q, want backend URL", gotURL)
+	}
+	if gotHost != "immutable.local" {
+		t.Fatalf("attempt Host = %q, want immutable.local", gotHost)
+	}
+	if gotBody != payload {
+		t.Fatalf("attempt body = %q, want %q", gotBody, payload)
+	}
+	if gotContentLength != int64(len(payload)) {
+		t.Fatalf("attempt ContentLength = %d, want %d", gotContentLength, len(payload))
+	}
+	if req.URL != originalURL || req.URL.String() != originalURLString {
+		t.Fatalf("original URL mutated to %q, want %q", req.URL.String(), originalURLString)
+	}
+	if req.Host != originalHost {
+		t.Fatalf("original Host mutated to %q, want %q", req.Host, originalHost)
+	}
+	if req.Body != originalBody {
+		t.Fatalf("original Body was replaced")
+	}
+	if req.GetBody != nil {
+		t.Fatalf("original GetBody was set")
+	}
+	if req.ContentLength != originalContentLength {
+		t.Fatalf("original ContentLength = %d, want %d", req.ContentLength, originalContentLength)
+	}
+}
+
+func TestTransport_RoundTripDoesNotMutateOriginalRequestOnRetry(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "http://retry-immutable.local/resource", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalURL := req.URL
+	originalURLString := req.URL.String()
+	originalHost := req.Host
+
+	var attemptURLs []string
+	var attemptHosts []string
+	transport := NewTransport(
+		WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			attemptURLs = append(attemptURLs, req.URL.String())
+			attemptHosts = append(attemptHosts, req.Host)
+			status := 500
+			body := "bad"
+			if len(attemptURLs) == 2 {
+				status = 200
+				body = "ok"
+			}
+			return &http.Response{
+				StatusCode: status,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Request:    req,
+			}, nil
+		})),
+		WithUpstreams(
+			Upstream("http://retry-immutable.local",
+				Server("http://10.0.0.1:8080"),
+				Server("http://10.0.0.2:8080"),
+			),
+		),
+	)
+
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	resp.Body.Close()
+
+	if len(attemptURLs) != 2 {
+		t.Fatalf("attempt count = %d, want 2", len(attemptURLs))
+	}
+	if attemptURLs[0] != "http://10.0.0.1:8080/resource" {
+		t.Fatalf("attempt 1 URL = %q, want first backend", attemptURLs[0])
+	}
+	if attemptURLs[1] != "http://10.0.0.2:8080/resource" {
+		t.Fatalf("attempt 2 URL = %q, want second backend", attemptURLs[1])
+	}
+	for i, host := range attemptHosts {
+		if host != "retry-immutable.local" {
+			t.Fatalf("attempt %d Host = %q, want retry-immutable.local", i+1, host)
+		}
+	}
+	if req.URL != originalURL || req.URL.String() != originalURLString {
+		t.Fatalf("original URL mutated to %q, want %q", req.URL.String(), originalURLString)
+	}
+	if req.Host != originalHost {
+		t.Fatalf("original Host mutated to %q, want %q", req.Host, originalHost)
+	}
+	if req.Body != nil {
+		t.Fatalf("original Body mutated to non-nil")
+	}
+	if req.GetBody != nil {
+		t.Fatalf("original GetBody mutated to non-nil")
 	}
 }
 
