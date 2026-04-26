@@ -20,6 +20,7 @@ func TestInterfaceCompliance(t *testing.T) {
 	var _ Balancer = NewIPHash(peers)
 	var _ Balancer = NewLeastConn(peers)
 	var _ Balancer = NewHash(peers)
+	var _ Balancer = NewHashConsistent(peers)
 	var _ Balancer = NewRandom(peers)
 	var _ Balancer = NewRandomTwo(peers)
 }

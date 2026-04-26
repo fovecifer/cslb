@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `HashConsistent` balancer and `UpstreamConfig.HashConsistent(keyFunc)`
+  option implementing ketama-style consistent hashing. Mirrors nginx's
+  `hash <key> consistent`. Ring construction is byte-compatible with
+  Cache::Memcached::Fast (160 virtual nodes per peer, chained
+  `crc32(host \0 port + prev_hash_LE)`), so cslb shares the same ring as
+  any standard ketama client configured against the same backends. On
+  peer removal only ~1/N of keys remap instead of nearly all of them.
+
+### Fixed
+
+- `prepareBody` no longer leaks `req.Body` when the seekable fast-path's
+  initial `Seek` fails, and now reconciles `req.ContentLength` with the
+  bytes that will actually be sent (clamping stale full-file values,
+  swapping to `http.NoBody` when the seeker is at EOF, and preserving
+  caller-requested chunked framing).
+
 ## [v2.0.0] - 2026-04-22
 
 ### Changed

@@ -325,6 +325,47 @@ func TestTransport_Hash(t *testing.T) {
 	}
 }
 
+func TestTransport_HashConsistent(t *testing.T) {
+	servers := make([]*httptest.Server, 4)
+	for i := range servers {
+		idx := i
+		servers[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, "backend-%d", idx)
+		}))
+		defer servers[i].Close()
+	}
+
+	tr := NewTransport(
+		WithUpstreams(
+			Upstream("http://chash.local",
+				Server(servers[0].URL),
+				Server(servers[1].URL),
+				Server(servers[2].URL),
+				Server(servers[3].URL),
+			).HashConsistent(func(r *http.Request) string {
+				return r.URL.Path
+			}),
+		),
+	)
+	client := &http.Client{Transport: tr}
+
+	// Same path consistently routes to the same backend.
+	var firstBody string
+	for i := 0; i < 10; i++ {
+		resp, err := client.Get("http://chash.local/items/42")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if i == 0 {
+			firstBody = string(body)
+		} else if string(body) != firstBody {
+			t.Errorf("inconsistent chash: got %s, expected %s", string(body), firstBody)
+		}
+	}
+}
+
 func TestTransport_Timeout(t *testing.T) {
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(2 * time.Second)

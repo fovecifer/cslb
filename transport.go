@@ -80,6 +80,7 @@ const (
 	AlgoHash
 	AlgoRandom
 	AlgoRandomTwo
+	AlgoHashConsistent
 )
 
 // ---------- Option types ----------
@@ -173,6 +174,16 @@ func (u UpstreamConfig) IPHash() UpstreamConfig {
 // Hash selects key-based hash for the upstream.
 func (u UpstreamConfig) Hash(keyFunc func(*http.Request) string) UpstreamConfig {
 	u.Algorithm = AlgoHash
+	u.HashFunc = keyFunc
+	return u
+}
+
+// HashConsistent selects ketama-style consistent hashing for the upstream.
+// Mirrors nginx's "hash <key> consistent". Compared to plain Hash, scaling
+// or restarting the upstream pool only redistributes ~1/N of keys instead
+// of nearly all of them.
+func (u UpstreamConfig) HashConsistent(keyFunc func(*http.Request) string) UpstreamConfig {
+	u.Algorithm = AlgoHashConsistent
 	u.HashFunc = keyFunc
 	return u
 }
@@ -466,10 +477,10 @@ func (cfg *upstreamConfig) normalize() {
 	if cfg.hashFunc != nil && cfg.algo == AlgoRoundRobin {
 		cfg.algo = AlgoHash
 	}
-	if cfg.hashFunc != nil && cfg.algo != AlgoHash {
+	if cfg.hashFunc != nil && cfg.algo != AlgoHash && cfg.algo != AlgoHashConsistent {
 		cfg.addError(errors.New("cslb: hash key function can only be used with hash algorithm"))
 	}
-	if cfg.algo == AlgoHash && cfg.hashFunc == nil {
+	if (cfg.algo == AlgoHash || cfg.algo == AlgoHashConsistent) && cfg.hashFunc == nil {
 		cfg.addError(errors.New("cslb: hash key function must not be nil"))
 	}
 }
@@ -543,6 +554,8 @@ func newBalancer(algo AlgorithmType, peers []*Peer) Balancer {
 		return NewIPHash(peers)
 	case AlgoHash:
 		return NewHash(peers)
+	case AlgoHashConsistent:
+		return NewHashConsistent(peers)
 	case AlgoRandom:
 		return NewRandom(peers)
 	case AlgoRandomTwo:
@@ -745,6 +758,10 @@ func (t *Transport) newPicker(ups *upstream, req *http.Request) Picker {
 		}
 	case AlgoHash:
 		if h, ok := ups.balancer.(*Hash); ok && ups.hashFunc != nil {
+			return h.NewPickerForKey(ups.hashFunc(req))
+		}
+	case AlgoHashConsistent:
+		if h, ok := ups.balancer.(*HashConsistent); ok && ups.hashFunc != nil {
 			return h.NewPickerForKey(ups.hashFunc(req))
 		}
 	}
