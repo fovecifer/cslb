@@ -35,9 +35,10 @@ func (rr *RoundRobin) Backup() *PeerGroup { return rr.backup }
 // Other algorithms embed this as their first field, mirroring
 // nginx's pattern where rrp is the first field of the per-request struct.
 type RRPicker struct {
-	primary *PeerGroup
-	backup  *PeerGroup
-	tried   map[*Peer]bool // nginx uses a bitmap; Go map is cleaner
+	primary     *PeerGroup
+	backup      *PeerGroup
+	tried       map[*Peer]bool // nginx uses a bitmap; Go map is cleaner
+	backupPhase bool
 }
 
 // NewRRPicker creates a round-robin picker.
@@ -52,22 +53,36 @@ func NewRRPicker(primary, backup *PeerGroup) *RRPicker {
 // Pick implements Picker.Pick using smooth weighted round-robin.
 // Corresponds to nginx's ngx_http_upstream_get_round_robin_peer().
 func (rr *RRPicker) Pick() *Peer {
-	// Try primary group
-	p := rr.pickFromGroup(rr.primary)
-	if p != nil {
-		return p
+	return rr.pickWithBackup(rr.pickFromGroup)
+}
+
+func (rr *RRPicker) pickWithBackup(pick func(*PeerGroup) *Peer) *Peer {
+	if !rr.backupPhase {
+		if p := pick(rr.primary); p != nil {
+			return p
+		}
 	}
 
-	// Fallback to backup group (nginx lines 667-689)
-	if rr.backup != nil && len(rr.backup.Peers) > 0 {
-		// Reset tried for backup group
-		for _, bp := range rr.backup.Peers {
-			delete(rr.tried, bp)
-		}
-		return rr.pickFromGroup(rr.backup)
+	if group := rr.backupGroupForPick(); group != nil {
+		return pick(group)
 	}
 
 	return nil
+}
+
+func (rr *RRPicker) backupGroupForPick() *PeerGroup {
+	if rr.backup == nil || len(rr.backup.Peers) == 0 {
+		return nil
+	}
+
+	if !rr.backupPhase {
+		rr.backupPhase = true
+		for _, bp := range rr.backup.Peers {
+			delete(rr.tried, bp)
+		}
+	}
+
+	return rr.backup
 }
 
 // pickFromGroup is the core smooth weighted round-robin algorithm.

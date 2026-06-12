@@ -537,6 +537,11 @@ func (t *Transport) registerUpstream(pattern string, cfg *upstreamConfig) {
 	}
 
 	key := upstreamKey{scheme: u.Scheme, host: u.Host}
+	if _, exists := t.upstreams[key]; exists {
+		t.addInitError(fmt.Errorf("cslb: duplicate upstream for %s://%s", u.Scheme, u.Host))
+		return
+	}
+
 	t.upstreams[key] = &upstream{
 		balancer: newBalancer(cfg.algo, cfg.peers),
 		backends: cfg.addrs,

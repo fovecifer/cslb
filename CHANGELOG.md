@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Backup peers are no longer retried more than once in the same request after
+  falling back from the primary peer group.
+- Duplicate upstream registrations for the same scheme and host now fail fast
+  during transport construction instead of silently replacing the previous
+  upstream.
 - `prepareBody` no longer leaks `req.Body` when the seekable fast-path's
   initial `Seek` fails, and now reconciles `req.ContentLength` with the
   bytes that will actually be sent (clamping stale full-file values,

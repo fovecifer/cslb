@@ -762,6 +762,25 @@ func TestNewTransportE_WithUpstreams_InvalidServerAddress(t *testing.T) {
 	}
 }
 
+func TestNewTransportE_WithUpstreams_DuplicateUpstream(t *testing.T) {
+	_, err := NewTransportE(
+		WithUpstreams(
+			Upstream("http://service.local",
+				Server("http://127.0.0.1:8080"),
+			),
+			Upstream("http://service.local",
+				Server("http://127.0.0.1:8081"),
+			),
+		),
+	)
+	if err == nil {
+		t.Fatal("expected error for duplicate upstream")
+	}
+	if !strings.Contains(err.Error(), "duplicate upstream for http://service.local") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestNewTransportE_WithUpstreams_HashRequiresKeyFunc(t *testing.T) {
 	_, err := NewTransportE(
 		WithUpstreams(

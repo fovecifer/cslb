@@ -43,20 +43,7 @@ type leastConnPicker struct {
 // Pick selects the peer with fewest weighted connections.
 // Corresponds to nginx's ngx_http_upstream_get_least_conn_peer() (lines 100-246).
 func (p *leastConnPicker) Pick() *Peer {
-	peer := p.pickFromGroup(p.PrimaryGroup())
-	if peer != nil {
-		return peer
-	}
-
-	// Fallback to backup
-	if bg := p.BackupGroup(); bg != nil && len(bg.Peers) > 0 {
-		for _, bp := range bg.Peers {
-			delete(p.tried, bp)
-		}
-		return p.pickFromGroup(bg)
-	}
-
-	return nil
+	return p.pickWithBackup(p.pickFromGroup)
 }
 
 func (p *leastConnPicker) pickFromGroup(group *PeerGroup) *Peer {

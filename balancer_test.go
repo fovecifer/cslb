@@ -101,6 +101,46 @@ func TestRR_BackupFallback(t *testing.T) {
 	pk.Done(p, false)
 }
 
+func TestBackupPeerTriedOnlyOncePerRequest(t *testing.T) {
+	tests := map[string]func([]*Peer) Balancer{
+		"round_robin": func(peers []*Peer) Balancer { return NewRoundRobin(peers) },
+		"least_conn":  func(peers []*Peer) Balancer { return NewLeastConn(peers) },
+	}
+
+	for name, newBalancer := range tests {
+		t.Run(name, func(t *testing.T) {
+			b := newBalancer([]*Peer{
+				{Addr: "primary", Weight: 1, MaxFails: 3},
+				{Addr: "backup", Weight: 1, MaxFails: 3, Backup: true},
+			})
+
+			pk := b.NewPicker()
+
+			p := pk.Pick()
+			if p == nil {
+				t.Fatal("first Pick returned nil")
+			}
+			if p.Addr != "primary" {
+				t.Fatalf("first Pick = %s, want primary", p.Addr)
+			}
+			pk.Done(p, true)
+
+			p = pk.Pick()
+			if p == nil {
+				t.Fatal("second Pick returned nil")
+			}
+			if p.Addr != "backup" {
+				t.Fatalf("second Pick = %s, want backup", p.Addr)
+			}
+			pk.Done(p, true)
+
+			if p = pk.Pick(); p != nil {
+				t.Fatalf("third Pick = %s, want nil after backup was already tried", p.Addr)
+			}
+		})
+	}
+}
+
 func TestRR_MaxConns(t *testing.T) {
 	b := NewRoundRobin([]*Peer{
 		{Addr: "A", Weight: 1, MaxConns: 1},
