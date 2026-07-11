@@ -1,6 +1,6 @@
 # cslb — Client Side Load Balance
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/fovecifer/cslb/v2.svg)](https://pkg.go.dev/github.com/fovecifer/cslb/v2)
+[![Go Reference](https://pkg.go.dev/badge/github.com/fovecifer/cslb/v3.svg)](https://pkg.go.dev/github.com/fovecifer/cslb/v3)
 
 `cslb` is a Go library that implements client-side load balancing as an
 `http.RoundTripper`. It intercepts outgoing HTTP requests, selects a backend,
@@ -29,8 +29,42 @@ execution model has deliberate differences, documented below.
 ## Install
 
 ```bash
-go get github.com/fovecifer/cslb/v2
+go get github.com/fovecifer/cslb/v3@v3.0.0-rc.1
 ```
+
+`v3.0.0-rc.1` is a release candidate. Pin the version while evaluating it so
+later prereleases are adopted intentionally.
+
+## Upgrade from v2
+
+Version 3 changes the Go module path. Update the dependency and every cslb
+import together:
+
+```bash
+go get github.com/fovecifer/cslb/v3@v3.0.0-rc.1
+go mod tidy
+```
+
+```diff
+-import "github.com/fovecifer/cslb/v2"
++import "github.com/fovecifer/cslb/v3"
+```
+
+The configuration API remains source-compatible after the import change, but
+the default failover behavior is intentionally safer and nginx-faithful:
+
+- HTTP responses, including every 5xx status, are returned without retrying.
+  Add `WithNextUpstreamCodes(...)` for the statuses your application can retry.
+- Sent `POST`, `LOCK`, and `PATCH` requests do not retry. Add
+  `WithNonIdempotentRetries()` only when idempotency keys or another mechanism
+  make replay safe.
+- Explicit invalid configuration is rejected by `NewTransportE`; use it when
+  construction errors must be handled rather than inspected later through
+  `Transport.Err()`.
+
+See [Retry and Failure Semantics](#retry-and-failure-semantics) for complete
+examples and the distinction between per-attempt timeouts and caller
+cancellation.
 
 ## Quick Start
 
@@ -42,7 +76,7 @@ import (
     "net/http"
     "time"
 
-    "github.com/fovecifer/cslb/v2"
+    "github.com/fovecifer/cslb/v3"
 )
 
 func main() {
@@ -169,7 +203,7 @@ The default policy matches nginx's `proxy_next_upstream error timeout`:
 - If the caller's request context is canceled or its overall deadline expires,
   cslb stops immediately and does not penalize the selected peer.
 
-> **Migration note:** earlier cslb releases retried every 5xx response and
+> **Migration note:** cslb v2 and earlier retried every 5xx response and
 > replayed sent POST-like requests by default. Existing applications that rely
 > on either behavior must add `WithNextUpstreamCodes` and, where replay is
 > genuinely safe, `WithNonIdempotentRetries`.

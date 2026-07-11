@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [v3.0.0-rc.1] - 2026-07-11
+
 ### Added
 
 - GitHub Actions CI covering Go 1.21 and the current stable Go release, with
@@ -24,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Bumped the Go module path to `github.com/fovecifer/cslb/v3`. Applications
+  upgrading from v2 must update their imports; the README now includes a
+  step-by-step migration guide and release-candidate installation command.
 - Consolidated the shared smooth-weighted selection core, winner commit path,
   and explicit server-field tracking to reduce algorithm and option-state
   duplication without changing selection results.
@@ -126,7 +131,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Backend options: `Weight`, `MaxFails`, `FailTimeout`, `MaxConns`, `AsBackup`, `AsDown`.
 - Standalone `PickOne` and `PickWithRetry` helpers for non-HTTP use cases.
 
-[Unreleased]: https://github.com/fovecifer/cslb/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/fovecifer/cslb/compare/v3.0.0-rc.1...HEAD
+[v3.0.0-rc.1]: https://github.com/fovecifer/cslb/compare/v2.0.0...v3.0.0-rc.1
 [v2.0.0]: https://github.com/fovecifer/cslb/compare/v1.1.0...v2.0.0
 [v1.1.0]: https://github.com/fovecifer/cslb/compare/v1.0.0...v1.1.0
 [v1.0.0]: https://github.com/fovecifer/cslb/releases/tag/v1.0.0

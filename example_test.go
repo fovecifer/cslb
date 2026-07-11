@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fovecifer/cslb/v2"
+	"github.com/fovecifer/cslb/v3"
 )
 
 // ----------------------------------------------------------------
@@ -134,10 +134,10 @@ func Example_algorithms() {
 }
 
 // ----------------------------------------------------------------
-// Example 3: All Backend options
+// Example 3: All Server options
 // ----------------------------------------------------------------
-// Demonstrates every configuration parameter supported by Backend.
-func Example_backendOptions() {
+// Demonstrates every configuration parameter supported by Server.
+func Example_serverOptions() {
 	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "ok")
 	}))
