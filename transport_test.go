@@ -2,7 +2,9 @@ package cslb
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -127,6 +129,7 @@ func TestTransport_FailoverToNextPeer(t *testing.T) {
 	defer good.Close()
 
 	tr := NewTransport(
+		WithNextUpstreamCodes(http.StatusInternalServerError),
 		WithUpstreams(
 			Upstream("http://failover.local",
 				Server(bad.URL),
@@ -160,6 +163,7 @@ func TestTransport_BackupFallback(t *testing.T) {
 	defer backup.Close()
 
 	tr := NewTransport(
+		WithNextUpstreamCodes(http.StatusInternalServerError),
 		WithUpstreams(
 			Upstream("http://backup.local",
 				Server(primary.URL),
@@ -236,6 +240,8 @@ func TestTransport_PostBodyRetried(t *testing.T) {
 
 	// Two backends pointing to the same server to test retry with body replay
 	tr := NewTransport(
+		WithNextUpstreamCodes(http.StatusInternalServerError),
+		WithNonIdempotentRetries(),
 		WithUpstreams(
 			Upstream("http://post.local",
 				Server(backend.URL),
@@ -384,30 +390,41 @@ func TestTransport_HashConsistent(t *testing.T) {
 	}
 }
 
-func TestTransport_Timeout(t *testing.T) {
-	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(2 * time.Second)
-		w.Write([]byte("slow"))
-	}))
-	defer slow.Close()
+func TestTransport_PerAttemptTimeoutFailsOver(t *testing.T) {
+	parentCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("fast"))
-	}))
-	defer fast.Close()
-
+	attempts := 0
 	tr := NewTransport(
-		WithTimeout(500*time.Millisecond),
+		WithTimeout(20*time.Millisecond),
+		WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			attempts++
+			if attempts == 1 {
+				<-req.Context().Done()
+				if !errors.Is(req.Context().Err(), context.DeadlineExceeded) {
+					t.Fatalf("attempt context error = %v, want deadline exceeded", req.Context().Err())
+				}
+				if parentCtx.Err() != nil {
+					t.Fatalf("parent context was canceled: %v", parentCtx.Err())
+				}
+				return nil, req.Context().Err()
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("fast")),
+				Request:    req,
+			}, nil
+		})),
 		WithUpstreams(
 			Upstream("http://timeout.local",
-				Server(slow.URL),
-				Server(fast.URL),
+				Server("http://10.0.0.1:8080"),
+				Server("http://10.0.0.2:8080"),
 			),
 		),
 	)
-	client := &http.Client{Transport: tr}
 
-	resp, err := client.Get("http://timeout.local/test")
+	req, _ := http.NewRequestWithContext(parentCtx, http.MethodGet, "http://timeout.local/test", nil)
+	resp, err := tr.RoundTrip(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,6 +433,12 @@ func TestTransport_Timeout(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "fast" {
 		t.Errorf("expected fast, got %s", string(body))
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if parentCtx.Err() != nil {
+		t.Fatalf("parent context error = %v, want nil", parentCtx.Err())
 	}
 }
 
@@ -464,7 +487,7 @@ func TestTransport_NextUpstreamCodes(t *testing.T) {
 	}))
 	defer b2.Close()
 
-	// Default behavior: 403 is NOT retried (only 5xx)
+	// Default behavior: HTTP status codes are not retried.
 	tr := NewTransport(
 		WithUpstreams(
 			Upstream("http://default.local",
@@ -631,6 +654,9 @@ func TestOptions_FailTimeout(t *testing.T) {
 	FailTimeout(30 * time.Second)(p)
 	if p.FailTimeout != 30*time.Second {
 		t.Errorf("FailTimeout = %v, want 30s", p.FailTimeout)
+	}
+	if !p.explicit.has(serverFieldFailTimeout) {
+		t.Error("FailTimeout should record that the value was explicitly set")
 	}
 }
 
@@ -950,6 +976,7 @@ func TestTransport_RoundTripDoesNotMutateOriginalRequestOnRetry(t *testing.T) {
 	var attemptURLs []string
 	var attemptHosts []string
 	transport := NewTransport(
+		WithNextUpstreamCodes(http.StatusInternalServerError),
 		WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 			attemptURLs = append(attemptURLs, req.URL.String())
 			attemptHosts = append(attemptHosts, req.Host)
@@ -1018,6 +1045,7 @@ func TestTransport_AllPeersFailReturnsLast(t *testing.T) {
 	defer bad.Close()
 
 	tr := NewTransport(
+		WithNextUpstreamCodes(http.StatusInternalServerError),
 		WithUpstreams(
 			Upstream("http://allbad.local",
 				Server(bad.URL),

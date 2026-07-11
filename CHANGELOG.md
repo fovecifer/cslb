@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - GitHub Actions CI covering Go 1.21 and the current stable Go release, with
   unit tests, `go vet`, race detection, and an 85% coverage floor.
+- `WithNonIdempotentRetries` for explicitly allowing sent `POST`, `LOCK`, and
+  `PATCH` requests to retry when the caller has made replay safe, such as with
+  an application-level idempotency key.
 - `HashConsistent` balancer and `UpstreamConfig.HashConsistent(keyFunc)`
   option implementing ketama-style consistent hashing. Mirrors nginx's
   `hash <key> consistent`. Ring construction is byte-compatible with
@@ -21,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Consolidated the shared smooth-weighted selection core, winner commit path,
+  and explicit server-field tracking to reduce algorithm and option-state
+  duplication without changing selection results.
+- Deduplicated agent collaboration instructions and clarified that operational
+  agent-control blocks are exempt from the project's English-only artifact
+  rule.
+- Default failover now matches nginx's `proxy_next_upstream error timeout`:
+  transport errors retry, while HTTP status codes require
+  `WithNextUpstreamCodes` or `WithNextUpstream`.
+- Retry examples and documentation now make HTTP status selection,
+  non-idempotent replay risk, request-body spill behavior, `ProxySSLName`, and
+  the intentional client-side differences from nginx explicit.
 - Clarified that IP-Hash only has a client IP in client-side usage when the
   caller provides `X-Real-IP`, `X-Forwarded-For`, or `RemoteAddr`; otherwise it
   falls back to Round-Robin, and explicit `Hash` keys are preferred for ordinary
@@ -30,6 +45,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `Transport.RoundTrip` now closes the request body on every error path that
+  returns before body preparation or delegation, including pre-canceled
+  requests and invalid underlying RoundTripper results.
+- Sent `POST`, `LOCK`, and `PATCH` requests no longer retry by default;
+  connection failures before the request is written can still fail over.
+- Explicit `FailTimeout(0)` is preserved instead of being replaced by the
+  10-second default.
+- A true single-peer upstream now ignores failure counters and effective-weight
+  degradation, while a one-primary/one-backup upstream retains normal failure
+  accounting and failover behavior across all algorithms.
+- Caller cancellation and overall request deadlines stop retry fan-out without
+  marking healthy peers as failed.
+- Configured 403 and 404 retries no longer increment peer failure counters or
+  reduce effective weight.
 - Explicit `MaxFails(0)` now disables temporary failure suppression while an
   omitted value continues to default to 1.
 - Invalid server and transport settings, unknown algorithms, and nil options

@@ -181,8 +181,8 @@ func Example_backendOptions() {
 // ----------------------------------------------------------------
 // Example 4: Automatic failover and backup servers
 // ----------------------------------------------------------------
-// When a primary server returns 5xx, the request is automatically retried
-// on the next peer, falling back to backup servers if needed.
+// HTTP status retries are opt-in. When a configured status is returned, the
+// request moves to the next peer and falls back to backup servers if needed.
 func Example_failoverAndBackup() {
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway) // 502
@@ -195,6 +195,7 @@ func Example_failoverAndBackup() {
 	defer good.Close()
 
 	transport := cslb.NewTransport(
+		cslb.WithNextUpstreamCodes(http.StatusBadGateway),
 		cslb.WithUpstreams(
 			cslb.Upstream("http://failover.local",
 				cslb.Server(bad.URL),                 // primary (returns 502)
@@ -208,11 +209,43 @@ func Example_failoverAndBackup() {
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 
-	// Primary returns 502 -> automatically falls back to backup
+	// The configured 502 response moves the request to the backup.
 	fmt.Println(string(body))
 
 	// Output:
 	// backup OK
+}
+
+// HTTP responses are not retried by default, including 5xx responses. Add
+// WithNextUpstreamCodes when a status should move to another backend.
+func Example_defaultRetryPolicy() {
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, "not retried")
+	}))
+	defer bad.Close()
+
+	unused := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "unexpected retry")
+	}))
+	defer unused.Close()
+
+	transport := cslb.NewTransport(
+		cslb.WithUpstreams(
+			cslb.Upstream("http://default-retry.local",
+				cslb.Server(bad.URL),
+				cslb.Server(unused.URL),
+			),
+		),
+	)
+
+	resp, _ := (&http.Client{Transport: transport}).Get("http://default-retry.local/test")
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	fmt.Println(resp.StatusCode, string(body))
+
+	// Output:
+	// 500 not retried
 }
 
 // ----------------------------------------------------------------
@@ -428,8 +461,9 @@ func Example_customTransport() {
 // ----------------------------------------------------------------
 // Example 10: POST body automatic replay on retry
 // ----------------------------------------------------------------
-// When a POST request fails on one backend, the body is automatically
-// buffered and replayed when retrying on the next backend.
+// POST retries require an explicit opt-in because replaying a request can
+// duplicate side effects. In production, pair this with an idempotency key or
+// equivalent deduplication. Once enabled, the body is buffered and replayed.
 // Supports three modes: GetBody callback, Seekable body, memory/file buffer.
 func Example_postBodyReplay() {
 	attempt := 0
@@ -445,6 +479,8 @@ func Example_postBodyReplay() {
 	defer b.Close()
 
 	transport := cslb.NewTransport(
+		cslb.WithNextUpstreamCodes(http.StatusInternalServerError),
+		cslb.WithNonIdempotentRetries(),
 		cslb.WithUpstreams(
 			cslb.Upstream("http://post.local",
 				cslb.Server(b.URL), // first attempt fails
@@ -471,7 +507,8 @@ func Example_postBodyReplay() {
 // Example 11: Large body spill to temporary file
 // ----------------------------------------------------------------
 // WithMaxBodyBuffer controls the maximum body size buffered in memory.
-// Bodies exceeding this limit are written to a temporary file to avoid OOM.
+// Bodies exceeding this threshold are written to a temporary file. It is not
+// a total upload-size limit, so applications should enforce that separately.
 func Example_maxBodyBuffer() {
 	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n, _ := io.Copy(io.Discard, r.Body)
@@ -566,9 +603,9 @@ func Example_passthrough() {
 // ----------------------------------------------------------------
 // Example 14: ProxySSLName - override TLS SNI for backend connections
 // ----------------------------------------------------------------
-// When backends are addressed by IP, TLS handshakes normally send
-// the IP as SNI. ProxySSLName overrides the SNI to the specified
-// hostname, matching nginx's proxy_ssl_server_name + proxy_ssl_name.
+// When a backend address does not match the certificate name,
+// ProxySSLName sets the TLS ServerName used for both SNI and verification,
+// matching nginx's proxy_ssl_server_name + proxy_ssl_name intent.
 func Example_proxySSLName() {
 	// Start a TLS backend that reports the SNI it received
 	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -583,7 +620,7 @@ func Example_proxySSLName() {
 		cslb.WithRoundTripper(testTransport),
 		cslb.WithUpstreams(
 			cslb.Upstream("https://api.example.com",
-				// Backend is an IP address — without ProxySSLName, SNI would be the IP
+				// The backend address does not provide the desired certificate/SNI name.
 				cslb.Server(backend.URL),
 			).ProxySSLName("example.com"), // Covered by the httptest certificate
 		),

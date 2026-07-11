@@ -110,11 +110,7 @@ func (p *randomPicker) pickOne() *Peer {
 		}
 
 		if !peer.Down && !p.Tried(peer) && peerAvailable(peer) {
-			if now.Sub(peer.checked) > peer.FailTimeout {
-				peer.checked = now
-			}
-			peer.conns++
-			p.SetTried(peer)
+			p.commitPeer(peer, now)
 			group.mu.Unlock()
 			return peer
 		}
@@ -160,11 +156,7 @@ func (p *randomPicker) pickTwo() *Peer {
 		if peer.conns*previous.Weight > previous.conns*peer.Weight {
 			selected = previous
 		}
-		if now.Sub(selected.checked) > selected.FailTimeout {
-			selected.checked = now
-		}
-		selected.conns++
-		p.SetTried(selected)
+		p.commitPeer(selected, now)
 		group.mu.Unlock()
 		return selected
 	}

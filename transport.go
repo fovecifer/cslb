@@ -9,9 +9,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,19 +33,22 @@ var (
 // configured load balancing algorithm and rewrites the request URL's Scheme
 // and Host before forwarding.
 type Transport struct {
-	transport      http.RoundTripper
-	upstreams      map[upstreamKey]*upstream
-	timeout        time.Duration
-	connectTimeout time.Duration
-	maxBodyBuffer  int64
-	nextUpstream   NextUpstreamCondition
-	initErr        error
+	transport          http.RoundTripper
+	upstreams          map[upstreamKey]*upstream
+	timeout            time.Duration
+	connectTimeout     time.Duration
+	maxBodyBuffer      int64
+	nextUpstream       NextUpstreamCondition
+	retryNonIdempotent bool
+	initErr            error
 }
 
 // NextUpstreamCondition determines whether a response should be considered
 // a failure and the request should be retried on the next upstream server.
 // It is called after each backend attempt. If it returns true, the Transport
-// will retry on the next available peer.
+// will retry on the next available peer when the request-method safety gate
+// allows it. Sent POST, LOCK, and PATCH requests require
+// WithNonIdempotentRetries.
 //
 // The resp parameter is nil when err is non-nil (connection error / timeout).
 type NextUpstreamCondition func(resp *http.Response, err error) bool
@@ -102,9 +107,8 @@ type ServerConfig struct {
 	FailTimeout time.Duration
 	Backup      bool
 
-	weightSet   bool
-	maxFailsSet bool
-	nilOption   bool
+	explicit  serverFieldSet
+	nilOption bool
 }
 
 // UpstreamConfig defines one upstream group and the servers behind it.
@@ -156,8 +160,7 @@ func Server(addr string, opts ...ServerOption) ServerConfig {
 		MaxFails:    peer.MaxFails,
 		FailTimeout: peer.FailTimeout,
 		Backup:      peer.Backup,
-		weightSet:   peer.weightSet,
-		maxFailsSet: peer.maxFailsSet,
+		explicit:    peer.explicit,
 		nilOption:   nilOption,
 	}
 }
@@ -218,7 +221,9 @@ func (u UpstreamConfig) RandomTwo() UpstreamConfig {
 	return u
 }
 
-// ProxySSLName sets the TLS SNI override for the upstream.
+// ProxySSLName sets the TLS server name used for both SNI and certificate
+// verification on this upstream. It requires the underlying RoundTripper to
+// be an *http.Transport.
 func (u UpstreamConfig) ProxySSLName(name string) UpstreamConfig {
 	u.SSLName = name
 	return u
@@ -372,6 +377,8 @@ func WithConnectTimeout(d time.Duration) TransportOption {
 
 // WithMaxBodyBuffer sets the maximum request body size to buffer in memory.
 // Bodies larger than this are spilled to a temporary file. Default is 32MB.
+// This is not a total body-size limit; callers should enforce a separate limit
+// for untrusted or very large request bodies.
 func WithMaxBodyBuffer(size int64) TransportOption {
 	return func(t *Transport) {
 		if size < 0 {
@@ -382,8 +389,9 @@ func WithMaxBodyBuffer(size int64) TransportOption {
 	}
 }
 
-// WithNextUpstream sets a custom condition to determine whether a response
-// is a failure that should trigger retrying on the next backend.
+// WithNextUpstream sets a custom condition to determine whether an attempt is
+// a candidate for retrying on the next backend. The non-idempotent request
+// gate is applied after this condition.
 // This corresponds to nginx's proxy_next_upstream directive.
 //
 // Example — only retry on 502/503/504:
@@ -407,7 +415,9 @@ func WithNextUpstream(cond NextUpstreamCondition) TransportOption {
 // timeouts always trigger a retry regardless of this setting.
 //
 // This corresponds to nginx's proxy_next_upstream http_xxx directives.
-// Default behavior (if not called): all 5xx status codes trigger retry.
+// If this option is not called, HTTP status codes do not trigger retry.
+// Configured 403 and 404 responses can be retried but do not count as peer
+// failures, matching nginx.
 //
 // Example — match nginx's "proxy_next_upstream error timeout http_502 http_503 http_504":
 //
@@ -423,6 +433,17 @@ func WithNextUpstreamCodes(codes ...int) TransportOption {
 		}
 		return codeSet[resp.StatusCode]
 	})
+}
+
+// WithNonIdempotentRetries allows requests using POST, LOCK, or PATCH to be
+// retried after they have been sent to an upstream server. By default these
+// methods are not retried after sending, matching nginx's non_idempotent gate.
+//
+// Enabling this option can duplicate side effects. Use it only when the
+// operation is safe to replay, for example when the application uses an
+// idempotency key.
+func WithNonIdempotentRetries() TransportOption {
+	return func(t *Transport) { t.retryNonIdempotent = true }
 }
 
 // WithUpstreams registers one or more explicit upstream blocks.
@@ -451,7 +472,7 @@ func WithUpstreams(upstreams ...UpstreamConfig) TransportOption {
 func Weight(w int) ServerOption {
 	return func(p *Peer) {
 		p.Weight = w
-		p.weightSet = true
+		p.explicit |= serverFieldWeight
 	}
 }
 
@@ -460,13 +481,17 @@ func Weight(w int) ServerOption {
 func MaxFails(n int) ServerOption {
 	return func(p *Peer) {
 		p.MaxFails = n
-		p.maxFailsSet = true
+		p.explicit |= serverFieldMaxFails
 	}
 }
 
-// FailTimeout sets the duration a failed server stays disabled.
+// FailTimeout sets the duration a failed server stays disabled. An explicit
+// zero is preserved; an omitted value defaults to 10 seconds.
 func FailTimeout(d time.Duration) ServerOption {
-	return func(p *Peer) { p.FailTimeout = d }
+	return func(p *Peer) {
+		p.FailTimeout = d
+		p.explicit |= serverFieldFailTimeout
+	}
 }
 
 // MaxConns sets the maximum concurrent connections to a server.
@@ -496,7 +521,7 @@ func (server ServerConfig) validate() error {
 	if server.nilOption {
 		err = errors.Join(err, errors.New("cslb: nil server option"))
 	}
-	if server.Weight < 0 || (server.weightSet && server.Weight == 0) {
+	if server.Weight < 0 || (server.explicit.has(serverFieldWeight) && server.Weight == 0) {
 		err = errors.Join(err, errors.New("weight must be greater than zero"))
 	}
 	if server.MaxConns < 0 {
@@ -583,8 +608,7 @@ func (t *Transport) registerExplicitUpstream(upstream UpstreamConfig) {
 			MaxFails:    server.MaxFails,
 			FailTimeout: server.FailTimeout,
 			Backup:      server.Backup,
-			weightSet:   server.weightSet,
-			maxFailsSet: server.maxFailsSet,
+			explicit:    server.explicit,
 		}
 		cfg.addPeer(peer, server.Address)
 	}
@@ -668,26 +692,36 @@ func (c *cancelCloser) Close() error {
 	return c.ReadCloser.Close()
 }
 
+type attemptDecision struct {
+	retry  bool
+	failed bool
+}
+
 // RoundTrip implements http.RoundTripper. It matches the request against
-// configured upstreams, selects a backend, rewrites the URL, and forwards
-// the request. Failed attempts are retried on other backends. When all
-// peers are exhausted the last attempt's (resp, err) is returned;
-// when no peer is ever available, ErrNoPeerAvailable is returned.
+// configured upstreams, selects a backend, rewrites the URL, and forwards the
+// request. Transport errors are retried by default; HTTP status codes require
+// WithNextUpstream or WithNextUpstreamCodes. Sent POST, LOCK, and PATCH
+// requests require WithNonIdempotentRetries before they can be replayed. When
+// all peers are exhausted the last attempt's (resp, err) is returned; when no
+// peer is ever available, ErrNoPeerAvailable is returned.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if t == nil {
-		return nil, ErrNilRoundTripper
+		return failRoundTrip(req, ErrNilRoundTripper)
 	}
 	if t.initErr != nil {
-		return nil, t.initErr
+		return failRoundTrip(req, t.initErr)
 	}
 	if req == nil {
-		return nil, ErrNilRequest
+		return failRoundTrip(nil, ErrNilRequest)
 	}
 	if req.URL == nil {
-		return nil, ErrNilRequestURL
+		return failRoundTrip(req, ErrNilRequestURL)
 	}
 	if t.transport == nil {
-		return nil, ErrNilRoundTripper
+		return failRoundTrip(req, ErrNilRoundTripper)
+	}
+	if err := req.Context().Err(); err != nil {
+		return failRoundTrip(req, err)
 	}
 
 	key := upstreamKey{scheme: req.URL.Scheme, host: req.URL.Host}
@@ -701,7 +735,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Create picker based on algorithm
 	pk := t.newPicker(ups, baseReq)
 	if pk == nil {
-		return nil, ErrInvalidUpstreamConfig
+		return failRoundTrip(req, ErrInvalidUpstreamConfig)
 	}
 
 	// Prepare body for retries
@@ -729,6 +763,11 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	for {
+		if err := reqCtx.Err(); err != nil {
+			closeLast()
+			return nil, err
+		}
+
 		peer := pk.Pick()
 		if peer == nil {
 			if lastResp != nil || lastErr != nil {
@@ -739,7 +778,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		addr := ups.backends[peer]
 		if addr == nil {
-			pk.Done(peer, true)
+			doneNeutral(pk, peer)
 			closeLast()
 			return nil, fmt.Errorf("cslb: selected peer %q has no backend address", peer.Addr)
 		}
@@ -763,7 +802,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if getBody != nil {
 			body, err := getBody()
 			if err != nil {
-				pk.Done(peer, true)
+				doneNeutral(pk, peer)
 				return nil, err
 			}
 			attemptReq.Body = body
@@ -784,6 +823,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			rt = ups.transport
 		}
 
+		attemptReq, requestSent := traceRequestSent(attemptReq)
 		resp, err := t.roundTrip(rt, attemptReq)
 
 		// Handle context cancellation
@@ -795,13 +835,25 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			resp.Body = &cancelCloser{ReadCloser: resp.Body, cancel: cancel}
 		}
 
-		// Determine if this attempt should be retried on next upstream.
-		// Default: retry on connection error or any 5xx status code.
-		// Configurable via WithNextUpstream / WithNextUpstreamCodes.
-		shouldRetry := t.shouldRetry(resp, err)
-		pk.Done(peer, shouldRetry)
+		// A caller cancellation is not an upstream failure. Do not fan the
+		// canceled request out across the remaining peers or penalize them.
+		if err != nil && reqCtx.Err() != nil {
+			doneNeutral(pk, peer)
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
+			return nil, reqCtx.Err()
+		}
 
-		if !shouldRetry {
+		decision := t.decideAttempt(
+			attemptReq,
+			resp,
+			err,
+			requestWasSent(rt, requestSent, resp, err),
+		)
+		pk.Done(peer, decision.failed)
+
+		if !decision.retry {
 			return resp, err
 		}
 
@@ -813,23 +865,108 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 }
 
+func failRoundTrip(req *http.Request, err error) (*http.Response, error) {
+	if req != nil && req.Body != nil {
+		_ = req.Body.Close()
+	}
+	return nil, err
+}
+
+func doneNeutral(picker Picker, peer *Peer) {
+	if neutral, ok := picker.(interface{ doneNeutral(*Peer) }); ok {
+		neutral.doneNeutral(peer)
+		return
+	}
+	// All built-in pickers implement doneNeutral. Keep a safe fallback for a
+	// future external Picker implementation so its connection count is released.
+	picker.Done(peer, false)
+}
+
 // shouldRetry determines whether the request should be retried on the next peer.
 func (t *Transport) shouldRetry(resp *http.Response, err error) bool {
 	if t.nextUpstream != nil {
 		return t.nextUpstream(resp, err)
 	}
-	// Default: retry on connection error or any 5xx
-	return err != nil || resp.StatusCode >= 500
+	// nginx defaults proxy_next_upstream to error and timeout. RoundTripper
+	// exposes both as errors; HTTP status codes are opt-in.
+	return err != nil
+}
+
+func (t *Transport) decideAttempt(req *http.Request, resp *http.Response, err error, sent bool) attemptDecision {
+	if !t.shouldRetry(resp, err) {
+		return attemptDecision{}
+	}
+
+	blockedNonIdempotent := sent && isNonIdempotentMethod(req.Method) && !t.retryNonIdempotent
+	decision := attemptDecision{
+		retry:  !blockedNonIdempotent,
+		failed: true,
+	}
+
+	if err == nil && resp != nil {
+		// nginx can pass 403/404 to the next peer when configured, but these
+		// statuses never count as an unsuccessful attempt for peer health.
+		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
+			decision.failed = false
+		}
+
+		// For response-status retries nginx applies the non-idempotent gate
+		// before calling the peer failure path. Transport errors reach that
+		// path first and therefore still count as failures.
+		if blockedNonIdempotent {
+			decision.failed = false
+		}
+	}
+
+	return decision
+}
+
+func isNonIdempotentMethod(method string) bool {
+	switch method {
+	case http.MethodPost, "LOCK", http.MethodPatch:
+		return true
+	default:
+		return false
+	}
+}
+
+func traceRequestSent(req *http.Request) (*http.Request, *atomic.Bool) {
+	sent := &atomic.Bool{}
+	trace := &httptrace.ClientTrace{
+		WroteHeaders: func() {
+			sent.Store(true)
+		},
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			sent.Store(true)
+		},
+	}
+	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace)), sent
+}
+
+func requestWasSent(rt http.RoundTripper, sent *atomic.Bool, resp *http.Response, err error) bool {
+	if resp != nil || sent.Load() {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+
+	// A standard http.Transport reports writes through httptrace, so an error
+	// before either write hook means the request was not sent. Arbitrary
+	// RoundTrippers have no equivalent contract; treat their errors as sent to
+	// avoid duplicating side effects.
+	_, standardTransport := rt.(*http.Transport)
+	return !standardTransport
 }
 
 func (t *Transport) roundTrip(rt http.RoundTripper, req *http.Request) (*http.Response, error) {
 	if rt == nil {
-		return nil, ErrNilRoundTripper
+		return failRoundTrip(req, ErrNilRoundTripper)
 	}
 
 	resp, err := rt.RoundTrip(req)
 	if resp == nil && err == nil {
-		return nil, ErrInvalidRoundTrip
+		return failRoundTrip(req, ErrInvalidRoundTrip)
 	}
 	return resp, err
 }

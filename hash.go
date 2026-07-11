@@ -99,11 +99,7 @@ func (p *hashPicker) Pick() *Peer {
 		}
 
 		if !selected.Down && !p.Tried(selected) && peerAvailable(selected) {
-			if now.Sub(selected.checked) > selected.FailTimeout {
-				selected.checked = now
-			}
-			selected.conns++
-			p.SetTried(selected)
+			p.commitPeer(selected, now)
 			group.mu.Unlock()
 			return selected
 		}

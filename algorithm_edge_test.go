@@ -76,6 +76,79 @@ func TestAlgorithms_FallBackToBackup(t *testing.T) {
 	}
 }
 
+func TestAlgorithms_SinglePeerIgnoresFailureAccounting(t *testing.T) {
+	for name, newPickerFactory := range algorithmPickerFactories() {
+		t.Run(name, func(t *testing.T) {
+			peer := &Peer{
+				Addr:        "only",
+				Weight:      10,
+				MaxFails:    1,
+				FailTimeout: time.Minute,
+			}
+			newPicker := newPickerFactory([]*Peer{peer})
+
+			picker := newPicker(1)
+			got := picker.Pick()
+			if got != peer {
+				t.Fatalf("Pick = %v, want only peer", got)
+			}
+			picker.Done(got, true)
+
+			if peer.fails != 0 {
+				t.Fatalf("fails = %d, want 0", peer.fails)
+			}
+			if peer.effectiveWeight != peer.Weight {
+				t.Fatalf("effective weight = %d, want %d", peer.effectiveWeight, peer.Weight)
+			}
+			if peer.conns != 0 {
+				t.Fatalf("connections = %d, want 0", peer.conns)
+			}
+
+			nextPicker := newPicker(2)
+			next := nextPicker.Pick()
+			if next != peer {
+				t.Fatalf("next Pick = %v, want only peer", next)
+			}
+			nextPicker.Done(next, false)
+		})
+	}
+}
+
+func TestAlgorithms_OnePrimaryAndBackupIsNotSingle(t *testing.T) {
+	for name, newPickerFactory := range algorithmPickerFactories() {
+		t.Run(name, func(t *testing.T) {
+			primary := &Peer{
+				Addr:        "primary",
+				Weight:      10,
+				MaxFails:    1,
+				FailTimeout: time.Minute,
+			}
+			backup := &Peer{Addr: "backup", Weight: 1, Backup: true}
+			newPicker := newPickerFactory([]*Peer{primary, backup})
+
+			picker := newPicker(1)
+			got := picker.Pick()
+			if got != primary {
+				t.Fatalf("first Pick = %v, want primary", got)
+			}
+			picker.Done(got, true)
+
+			if primary.fails != 1 {
+				t.Fatalf("primary fails = %d, want 1", primary.fails)
+			}
+			if primary.effectiveWeight >= primary.Weight {
+				t.Fatalf("primary effective weight = %d, want degraded below %d", primary.effectiveWeight, primary.Weight)
+			}
+
+			got = picker.Pick()
+			if got != backup {
+				t.Fatalf("second Pick = %v, want backup", got)
+			}
+			picker.Done(got, false)
+		})
+	}
+}
+
 func TestIPHash_NoIPFallsBackToRoundRobin(t *testing.T) {
 	balancer := NewIPHash([]*Peer{
 		{Addr: "A", Weight: 1},

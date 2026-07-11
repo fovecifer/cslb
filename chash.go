@@ -86,7 +86,7 @@ type chashPicker struct {
 // Corresponds to nginx's ngx_http_upstream_get_chash_peer().
 func (p *chashPicker) Pick() *Peer {
 	points := p.balancer.points
-	if p.key == "" || len(points) == 0 {
+	if p.PrimaryGroup().single || p.key == "" || len(points) == 0 {
 		return p.RRPicker.Pick()
 	}
 
@@ -104,29 +104,12 @@ func (p *chashPicker) Pick() *Peer {
 		// that server string, so choose among matching peers with smooth
 		// weighted round-robin instead of pinning the point to one Peer pointer.
 		server := points[(p.cursor+p.tries)%len(points)].peer.Addr
-		var best *Peer
-		total := 0
-		for _, peer := range group.Peers {
-			if peer.Addr != server || peer.Down || p.Tried(peer) || !peerAvailable(peer) {
-				continue
-			}
-			peer.currentWeight += peer.effectiveWeight
-			total += peer.effectiveWeight
-			if peer.effectiveWeight < peer.Weight {
-				peer.effectiveWeight++
-			}
-			if best == nil || peer.currentWeight > best.currentWeight {
-				best = peer
-			}
-		}
+		best := smoothWeightedPeer(group.Peers, func(peer *Peer) bool {
+			return peer.Addr == server && !peer.Down && !p.Tried(peer) && peerAvailable(peer)
+		})
 
 		if best != nil {
-			best.currentWeight -= total
-			if now.Sub(best.checked) > best.FailTimeout {
-				best.checked = now
-			}
-			best.conns++
-			p.SetTried(best)
+			p.commitPeer(best, now)
 			group.mu.Unlock()
 			return best
 		}

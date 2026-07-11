@@ -58,16 +58,23 @@ func (rr *RRPicker) Pick() *Peer {
 
 func (rr *RRPicker) pickWithBackup(pick func(*PeerGroup) *Peer) *Peer {
 	if !rr.backupPhase {
-		if p := pick(rr.primary); p != nil {
+		if p := rr.pickFromCurrentGroup(rr.primary, pick); p != nil {
 			return p
 		}
 	}
 
 	if group := rr.backupGroupForPick(); group != nil {
-		return pick(group)
+		return rr.pickFromCurrentGroup(group, pick)
 	}
 
 	return nil
+}
+
+func (rr *RRPicker) pickFromCurrentGroup(group *PeerGroup, pick func(*PeerGroup) *Peer) *Peer {
+	if group.single {
+		return rr.pickFromGroup(group)
+	}
+	return pick(group)
 }
 
 func (rr *RRPicker) backupGroupForPick() *PeerGroup {
@@ -91,19 +98,28 @@ func (rr *RRPicker) pickFromGroup(group *PeerGroup) *Peer {
 	group.mu.Lock()
 	defer group.mu.Unlock()
 
-	now := time.Now()
-	var best *Peer
-	total := 0
+	if group.single {
+		peer := group.Peers[0]
+		if rr.tried[peer] || peer.Down ||
+			(peer.MaxConns > 0 && peer.conns >= peer.MaxConns) {
+			return nil
+		}
 
-	for _, peer := range group.Peers {
+		peer.conns++
+		rr.tried[peer] = true
+		return peer
+	}
+
+	now := time.Now()
+	best := smoothWeightedPeer(group.Peers, func(peer *Peer) bool {
 		// Skip already tried (nginx: rrp->tried[n] & m)
 		if rr.tried[peer] {
-			continue
+			return false
 		}
 
 		// Skip down peers
 		if peer.Down {
-			continue
+			return false
 		}
 
 		// Skip peers exceeding max_fails within fail_timeout
@@ -111,48 +127,76 @@ func (rr *RRPicker) pickFromGroup(group *PeerGroup) *Peer {
 		if peer.MaxFails > 0 &&
 			peer.fails >= peer.MaxFails &&
 			now.Sub(peer.checked) <= peer.FailTimeout {
-			continue
+			return false
 		}
 
 		// Skip peers at max_conns
 		if peer.MaxConns > 0 && peer.conns >= peer.MaxConns {
-			continue
+			return false
 		}
-
-		// --- Core algorithm (nginx lines 747-757) ---
-		peer.currentWeight += peer.effectiveWeight
-		total += peer.effectiveWeight
-
-		// Slowly recover effective_weight (nginx line 750-752)
-		if peer.effectiveWeight < peer.Weight {
-			peer.effectiveWeight++
-		}
-
-		if best == nil || peer.currentWeight > best.currentWeight {
-			best = peer
-		}
-	}
+		return true
+	})
 
 	if best == nil {
 		return nil
 	}
 
-	// Subtract total from winner (nginx line 772)
-	best.currentWeight -= total
+	return rr.commitPeer(best, now)
+}
 
-	if now.Sub(best.checked) > best.FailTimeout {
-		best.checked = now
+// smoothWeightedPeer runs nginx's smooth weighted round-robin core over the
+// eligible peers. The caller must hold the owning PeerGroup lock.
+func smoothWeightedPeer(peers []*Peer, eligible func(*Peer) bool) *Peer {
+	var best *Peer
+	total := 0
+
+	for _, peer := range peers {
+		if !eligible(peer) {
+			continue
+		}
+
+		peer.currentWeight += peer.effectiveWeight
+		total += peer.effectiveWeight
+		if peer.effectiveWeight < peer.Weight {
+			peer.effectiveWeight++
+		}
+		if best == nil || peer.currentWeight > best.currentWeight {
+			best = peer
+		}
 	}
 
-	best.conns++
-	rr.tried[best] = true
-
+	if best != nil {
+		best.currentWeight -= total
+	}
 	return best
+}
+
+// commitPeer records a selected winner. The caller must hold the owning
+// PeerGroup lock. The single-peer fast path intentionally does not use this
+// helper because nginx does not update checked in that path.
+func (rr *RRPicker) commitPeer(peer *Peer, now time.Time) *Peer {
+	if now.Sub(peer.checked) > peer.FailTimeout {
+		peer.checked = now
+	}
+	peer.conns++
+	rr.SetTried(peer)
+	return peer
 }
 
 // Done implements Picker.Done.
 // Corresponds to nginx's ngx_http_upstream_free_round_robin_peer() (lines 782-863).
 func (rr *RRPicker) Done(peer *Peer, failed bool) {
+	rr.done(peer, failed, false)
+}
+
+// doneNeutral releases a selected peer without changing its health state.
+// Transport uses this for caller cancellation and local replay/configuration
+// errors that say nothing about the upstream server.
+func (rr *RRPicker) doneNeutral(peer *Peer) {
+	rr.done(peer, false, true)
+}
+
+func (rr *RRPicker) done(peer *Peer, failed bool, neutral bool) {
 	if peer == nil {
 		return
 	}
@@ -171,6 +215,16 @@ found:
 
 	group.mu.Lock()
 	defer group.mu.Unlock()
+
+	if group.single {
+		peer.fails = 0
+		peer.conns--
+		return
+	}
+	if neutral {
+		peer.conns--
+		return
+	}
 
 	now := time.Now()
 

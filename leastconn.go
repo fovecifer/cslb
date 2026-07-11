@@ -93,44 +93,26 @@ func (p *leastConnPicker) pickFromGroup(group *PeerGroup) *Peer {
 		// Match nginx's second pass: only peers tied at the minimum normalized
 		// connection count participate in smooth weighted round-robin.
 		least := best
-		best = nil
-		total := 0
-		for _, peer := range group.Peers {
+		best = smoothWeightedPeer(group.Peers, func(peer *Peer) bool {
 			if p.Tried(peer) || peer.Down {
-				continue
+				return false
 			}
 			if peer.conns*least.Weight != least.conns*peer.Weight {
-				continue
+				return false
 			}
 			if peer.MaxFails > 0 &&
 				peer.fails >= peer.MaxFails &&
 				now.Sub(peer.checked) <= peer.FailTimeout {
-				continue
+				return false
 			}
 			if peer.MaxConns > 0 && peer.conns >= peer.MaxConns {
-				continue
+				return false
 			}
-
-			peer.currentWeight += peer.effectiveWeight
-			total += peer.effectiveWeight
-			if peer.effectiveWeight < peer.Weight {
-				peer.effectiveWeight++
-			}
-			if best == nil || peer.currentWeight > best.currentWeight {
-				best = peer
-			}
-		}
-		best.currentWeight -= total
+			return true
+		})
 	}
 
-	if now.Sub(best.checked) > best.FailTimeout {
-		best.checked = now
-	}
-
-	best.conns++
-	p.SetTried(best)
-
-	return best
+	return p.commitPeer(best, now)
 }
 
 // Done delegates to the embedded RR picker.

@@ -116,11 +116,7 @@ func (p *ipHashPicker) Pick() *Peer {
 
 		// Check availability (same checks as RR: down, tried, max_fails, max_conns)
 		if !selected.Down && !p.Tried(selected) && peerAvailable(selected) {
-			if now.Sub(selected.checked) > selected.FailTimeout {
-				selected.checked = now
-			}
-			selected.conns++
-			p.SetTried(selected)
+			p.commitPeer(selected, now)
 			p.hash = hash
 			group.mu.Unlock()
 			return selected

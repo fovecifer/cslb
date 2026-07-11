@@ -4,7 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Rules
 
-- Always use English for all generated code, comments, commit messages, and documentation in this project.
+- Always use English for project code, code comments, commit messages, and user-facing documentation.
+- Agent-operation instruction files and tool-managed collaboration blocks are exempt from the English-only rule and may use the language required by their workflow.
 - Never use `panic` in library code; return errors instead.
 - Always update CHANGELOG.md when releasing a new version.
 - Follow the **fail-fast** strategy: validate inputs and preconditions at the earliest possible point (constructors, option functions, public API boundaries) and return an error immediately rather than deferring failure to a later call. Never silently ignore errors (`_ = err`) — either handle them or propagate them to the caller.
@@ -43,7 +44,7 @@ There is no build step — this is a library with no binary. There is no linter 
 - **`PeerGroup`** (`balancer.go`) — a list of peers sharing a mutex; split into primary and backup groups via `BuildGroups()`.
 - **`Balancer`** interface — one per upstream group, creates `Picker`s on demand.
 - **`Picker`** interface — per-request state; `Pick()` returns next peer, `Done()` reports success/failure.
-- **`Transport`** (`transport.go`) — implements `http.RoundTripper`. Matches requests by `scheme+host`, rewrites URL to selected backend, retries on failure. Buffers request bodies for replay (memory up to `maxBodyBuffer`, then spills to a temp file).
+- **`Transport`** (`transport.go`) — implements `http.RoundTripper`. Matches requests by `scheme+host`, rewrites URLs to selected backends, retries transport errors and configured HTTP statuses, and protects sent POST-like methods from replay by default. Request bodies are replayed through `GetBody`, seeking, or memory/temp-file buffering.
 
 ### Algorithm structure
 
@@ -58,10 +59,10 @@ All algorithms wrap `RoundRobin` as a base layer, matching nginx's decorator pat
 
 ### Request flow in `Transport.RoundTrip`
 
-1. Match request `scheme+host` against registered upstreams; pass through unchanged if no match.
-2. Buffer request body via `prepareBody()` so it can be replayed on retries.
-3. Loop: `Pick()` a peer → rewrite URL → send → call `shouldRetry()` → call `Done()`.
-4. On retry, close the failed response body and loop. When no peers remain, forward to the underlying transport directly.
+1. Match request `scheme+host` against registered upstreams; pass unmatched requests through unchanged.
+2. Prepare the request body via `prepareBody()` so it can be replayed when policy permits a retry.
+3. Loop: `Pick()` a peer → rewrite URL → send → classify retry and peer-health outcomes separately → call `Done()` or the internal neutral-release path.
+4. On retry, close the previous response body and loop. When peers are exhausted, return the last attempt; when no peer was ever available, return `ErrNoPeerAvailable`.
 
 ### Options pattern
 

@@ -57,6 +57,48 @@ func TestNewTransportE_PreservesExplicitMaxFailsZero(t *testing.T) {
 	}
 }
 
+func TestFailTimeout_ExplicitZeroIsPreserved(t *testing.T) {
+	peer := &Peer{Addr: "A", Weight: 1}
+	FailTimeout(0)(peer)
+	NewRoundRobin([]*Peer{peer})
+
+	if peer.FailTimeout != 0 {
+		t.Fatalf("FailTimeout = %v, want 0", peer.FailTimeout)
+	}
+}
+
+func TestFailTimeout_UnsetStillDefaultsToTenSeconds(t *testing.T) {
+	peer := &Peer{Addr: "A", Weight: 1}
+	NewRoundRobin([]*Peer{peer})
+
+	if peer.FailTimeout != 10*time.Second {
+		t.Fatalf("FailTimeout = %v, want 10s", peer.FailTimeout)
+	}
+}
+
+func TestNewTransportE_PreservesExplicitFailTimeoutZero(t *testing.T) {
+	transport, err := NewTransportE(
+		WithUpstreams(
+			Upstream("http://service.local",
+				Server("http://127.0.0.1:8080", FailTimeout(0)),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("NewTransportE: %v", err)
+	}
+
+	ups := transport.upstreams[upstreamKey{scheme: "http", host: "service.local"}]
+	roundRobin, ok := ups.balancer.(*RoundRobin)
+	if !ok {
+		t.Fatalf("balancer type = %T, want *RoundRobin", ups.balancer)
+	}
+	peer := roundRobin.primary.Peers[0]
+	if peer.FailTimeout != 0 {
+		t.Fatalf("FailTimeout = %v, want 0", peer.FailTimeout)
+	}
+}
+
 func TestNewTransportE_RejectsInvalidServerSettings(t *testing.T) {
 	tests := []struct {
 		name    string

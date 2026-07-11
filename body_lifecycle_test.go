@@ -62,6 +62,86 @@ func TestTransport_GetBodyClosesOriginalBody(t *testing.T) {
 	}
 }
 
+func TestTransport_EarlyErrorsCloseRequestBody(t *testing.T) {
+	initErr := errors.New("initialization failed")
+
+	tests := []struct {
+		name    string
+		run     func(*http.Request) (*http.Response, error)
+		wantErr error
+	}{
+		{
+			name: "nil transport receiver",
+			run: func(req *http.Request) (*http.Response, error) {
+				var transport *Transport
+				return transport.RoundTrip(req)
+			},
+			wantErr: ErrNilRoundTripper,
+		},
+		{
+			name: "retained initialization error",
+			run: func(req *http.Request) (*http.Response, error) {
+				return (&Transport{initErr: initErr}).RoundTrip(req)
+			},
+			wantErr: initErr,
+		},
+		{
+			name: "nil request URL",
+			run: func(req *http.Request) (*http.Response, error) {
+				req.URL = nil
+				return NewTransport().RoundTrip(req)
+			},
+			wantErr: ErrNilRequestURL,
+		},
+		{
+			name: "nil underlying transport",
+			run: func(req *http.Request) (*http.Response, error) {
+				return (&Transport{}).RoundTrip(req)
+			},
+			wantErr: ErrNilRoundTripper,
+		},
+		{
+			name: "invalid upstream picker",
+			run: func(req *http.Request) (*http.Response, error) {
+				transport := NewTransport()
+				transport.upstreams[upstreamKey{scheme: "http", host: "early-error.local"}] = &upstream{}
+				return transport.RoundTrip(req)
+			},
+			wantErr: ErrInvalidUpstreamConfig,
+		},
+		{
+			name: "invalid underlying RoundTripper result",
+			run: func(req *http.Request) (*http.Response, error) {
+				transport := NewTransport(
+					WithRoundTripper(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+						return nil, nil
+					})),
+				)
+				return transport.RoundTrip(req)
+			},
+			wantErr: ErrInvalidRoundTrip,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := newTrackingBody("payload")
+			req, err := http.NewRequest(http.MethodPost, "http://early-error.local/upload", body)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = test.run(req)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("RoundTrip error = %v, want %v", err, test.wantErr)
+			}
+			if !body.closed {
+				t.Fatal("request body was not closed")
+			}
+		})
+	}
+}
+
 func TestPrepareBody_BuffersInMemoryAndReplays(t *testing.T) {
 	original := newTrackingBody("payload")
 	req := &http.Request{Body: original, ContentLength: -1}

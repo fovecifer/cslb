@@ -3,8 +3,8 @@
 //
 // It works by intercepting HTTP requests, selecting a backend server using
 // the configured load balancing algorithm, and rewriting the request URL's
-// Scheme and Host before forwarding. Failed requests are automatically
-// retried on the next available backend.
+// Scheme and Host before forwarding. Transport errors are retried on the next
+// available backend by default; HTTP status retries are opt-in.
 //
 // Architecture mirrors nginx's three-layer callback design:
 //
@@ -26,6 +26,18 @@ import (
 
 // ---------- Peer: a single backend server ----------
 
+type serverFieldSet uint8
+
+const (
+	serverFieldWeight serverFieldSet = 1 << iota
+	serverFieldMaxFails
+	serverFieldFailTimeout
+)
+
+func (set serverFieldSet) has(field serverFieldSet) bool {
+	return set&field != 0
+}
+
 // Peer represents a backend server.
 type Peer struct {
 	Addr   string
@@ -38,10 +50,9 @@ type Peer struct {
 
 	Backup bool // if true, only used when all primary peers fail
 
-	// Configuration presence flags distinguish an omitted zero value from an
-	// explicit nginx-compatible zero supplied through a ServerOption.
-	weightSet   bool
-	maxFailsSet bool
+	// explicit distinguishes omitted zero values from nginx-compatible zeros
+	// supplied through ServerOptions.
+	explicit serverFieldSet
 
 	// Mutable state — protected by PeerGroup.mu
 	currentWeight   int
@@ -56,10 +67,10 @@ func (p *Peer) init() {
 	if p.Weight <= 0 {
 		p.Weight = 1
 	}
-	if p.MaxFails == 0 && !p.maxFailsSet {
+	if p.MaxFails == 0 && !p.explicit.has(serverFieldMaxFails) {
 		p.MaxFails = 1
 	}
-	if p.FailTimeout == 0 {
+	if p.FailTimeout == 0 && !p.explicit.has(serverFieldFailTimeout) {
 		p.FailTimeout = 10 * time.Second
 	}
 	p.effectiveWeight = p.Weight
@@ -73,7 +84,8 @@ type PeerGroup struct {
 	mu          sync.Mutex
 	Peers       []*Peer
 	TotalWeight int
-	Tries       int // number of non-down peers
+	Tries       int  // number of non-down peers
+	single      bool // nginx single-peer fast path; false whenever backups exist
 }
 
 // BuildGroups splits peers into primary and backup groups.
@@ -103,6 +115,7 @@ func BuildGroups(peers []*Peer) (primary *PeerGroup, backup *PeerGroup) {
 
 	if len(backup.Peers) == 0 {
 		backup = nil
+		primary.single = len(primary.Peers) == 1
 	}
 	return
 }
