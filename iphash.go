@@ -1,12 +1,15 @@
 package cslb
 
-import "net"
+import (
+	"net"
+	"time"
+)
 
 // ---------- IPHash Balancer ----------
 // Corresponds to nginx's ngx_http_upstream_ip_hash_module.c
 //
-// Uses client IP to consistently route to the same backend.
-// Falls back to round-robin after maxIPHashTries failed attempts.
+// Uses client IP to consistently route to the same backend. If no client IP is
+// supplied, it falls back to round-robin selection.
 
 const maxIPHashTries = 20 // nginx: 20 tries before fallback
 
@@ -24,6 +27,7 @@ func NewIPHash(peers []*Peer) *IPHash {
 func (h *IPHash) NewPicker() Picker {
 	return &ipHashPicker{
 		RRPicker: NewRRPicker(h.rr.primary, h.rr.backup),
+		hash:     89,
 	}
 }
 
@@ -32,6 +36,7 @@ func (h *IPHash) NewPickerForIP(clientIP net.IP) Picker {
 	return &ipHashPicker{
 		RRPicker: NewRRPicker(h.rr.primary, h.rr.backup),
 		clientIP: clientIP,
+		hash:     89,
 	}
 }
 
@@ -48,8 +53,10 @@ func (h *IPHash) NewPickerForIP(clientIP net.IP) Picker {
 //	} ngx_http_upstream_ip_hash_peer_data_t;
 
 type ipHashPicker struct {
-	*RRPicker          // embedded RR picker (nginx: rrp as first field)
-	clientIP  net.IP   // parsed client IP
+	*RRPicker        // embedded RR picker (nginx: rrp as first field)
+	clientIP  net.IP // parsed client IP
+	hash      uint32 // rolling nginx hash, initialized to 89
+	tries     int    // number of rejected hash candidates
 }
 
 // Pick selects a peer based on client IP hash.
@@ -57,8 +64,8 @@ type ipHashPicker struct {
 func (p *ipHashPicker) Pick() *Peer {
 	group := p.PrimaryGroup()
 
-	if len(group.Peers) == 0 {
-		return nil
+	if len(group.Peers) < 2 {
+		return p.RRPicker.Pick()
 	}
 
 	// If no client IP, fall back to round-robin
@@ -72,6 +79,9 @@ func (p *ipHashPicker) Pick() *Peer {
 	if addr == nil {
 		addr = p.clientIP.To16()
 	}
+	if addr == nil {
+		return p.RRPicker.Pick()
+	}
 	addrLen := 3
 	if len(addr) > 4 {
 		addrLen = len(addr)
@@ -81,20 +91,14 @@ func (p *ipHashPicker) Pick() *Peer {
 	}
 
 	group.mu.Lock()
-	defer group.mu.Unlock()
+	now := time.Now()
+	hash := p.hash
 
-	// nginx hash: hash = (hash * 113 + addr[i]) % 6271
-	// Repeated 3 rounds over the address bytes
-	hash := uint32(89)
-
-	for round := 0; round < 3; round++ {
+	for p.tries <= maxIPHashTries {
+		// nginx folds the address into the rolling hash once per candidate.
 		for i := 0; i < addrLen; i++ {
 			hash = (hash*113 + uint32(addr[i])) % 6271
 		}
-	}
-
-	// Try up to maxIPHashTries times with incrementing hash
-	for tries := 0; tries < maxIPHashTries; tries++ {
 		w := int(hash % uint32(group.TotalWeight))
 
 		var selected *Peer
@@ -112,22 +116,21 @@ func (p *ipHashPicker) Pick() *Peer {
 
 		// Check availability (same checks as RR: down, tried, max_fails, max_conns)
 		if !selected.Down && !p.Tried(selected) && peerAvailable(selected) {
+			if now.Sub(selected.checked) > selected.FailTimeout {
+				selected.checked = now
+			}
 			selected.conns++
 			p.SetTried(selected)
+			p.hash = hash
+			group.mu.Unlock()
 			return selected
 		}
 
-		// nginx: hash = (hash + 113) % 6271 to try next slot
-		hash = (hash + 113) % 6271
+		p.tries++
 	}
 
 	group.mu.Unlock()
-
-	// Fallback to round-robin (nginx line 168: iphp->get_rr_peer)
-	result := p.RRPicker.Pick()
-
-	group.mu.Lock() // re-lock for deferred unlock
-	return result
+	return p.RRPicker.Pick()
 }
 
 // Done delegates to the embedded RR picker.

@@ -101,6 +101,10 @@ type ServerConfig struct {
 	MaxFails    int
 	FailTimeout time.Duration
 	Backup      bool
+
+	weightSet   bool
+	maxFailsSet bool
+	nilOption   bool
 }
 
 // UpstreamConfig defines one upstream group and the servers behind it.
@@ -135,7 +139,12 @@ func Upstream(pattern string, servers ...ServerConfig) UpstreamConfig {
 // Server creates an explicit backend server entry for use inside Upstream.
 func Server(addr string, opts ...ServerOption) ServerConfig {
 	peer := &Peer{Addr: addr}
+	nilOption := false
 	for _, opt := range opts {
+		if opt == nil {
+			nilOption = true
+			continue
+		}
 		opt(peer)
 	}
 
@@ -147,6 +156,9 @@ func Server(addr string, opts ...ServerOption) ServerConfig {
 		MaxFails:    peer.MaxFails,
 		FailTimeout: peer.FailTimeout,
 		Backup:      peer.Backup,
+		weightSet:   peer.weightSet,
+		maxFailsSet: peer.maxFailsSet,
+		nilOption:   nilOption,
 	}
 }
 
@@ -164,7 +176,11 @@ func (u UpstreamConfig) LeastConn() UpstreamConfig {
 	return u
 }
 
-// IPHash selects IP-hash for the upstream.
+// IPHash selects IP-hash for the upstream. In client-side use, this is only
+// meaningful when the caller sets X-Real-IP, X-Forwarded-For, or RemoteAddr on
+// outgoing requests; otherwise no client IP is available and selection falls
+// back to round-robin. For ordinary client affinity, prefer Hash with an
+// explicit request key.
 func (u UpstreamConfig) IPHash() UpstreamConfig {
 	u.Algorithm = AlgoIPHash
 	u.HashFunc = nil
@@ -242,6 +258,10 @@ func NewTransportE(opts ...TransportOption) (*Transport, error) {
 		maxBodyBuffer: defaultMaxBodyBuffer,
 	}
 	for _, opt := range opts {
+		if opt == nil {
+			t.addInitError(errors.New("cslb: nil transport option"))
+			continue
+		}
 		opt(t)
 	}
 	if t.transport == nil {
@@ -329,19 +349,37 @@ func WithRoundTripper(rt http.RoundTripper) TransportOption {
 // WithTimeout sets the per-attempt request timeout. Each backend attempt gets
 // its own timeout derived from the original request context.
 func WithTimeout(d time.Duration) TransportOption {
-	return func(t *Transport) { t.timeout = d }
+	return func(t *Transport) {
+		if d < 0 {
+			t.addInitError(errors.New("cslb: attempt timeout must be non-negative"))
+			return
+		}
+		t.timeout = d
+	}
 }
 
 // WithConnectTimeout sets the TCP connect timeout for the default transport.
 // Ignored if WithRoundTripper is used.
 func WithConnectTimeout(d time.Duration) TransportOption {
-	return func(t *Transport) { t.connectTimeout = d }
+	return func(t *Transport) {
+		if d < 0 {
+			t.addInitError(errors.New("cslb: connect timeout must be non-negative"))
+			return
+		}
+		t.connectTimeout = d
+	}
 }
 
 // WithMaxBodyBuffer sets the maximum request body size to buffer in memory.
 // Bodies larger than this are spilled to a temporary file. Default is 32MB.
 func WithMaxBodyBuffer(size int64) TransportOption {
-	return func(t *Transport) { t.maxBodyBuffer = size }
+	return func(t *Transport) {
+		if size < 0 {
+			t.addInitError(errors.New("cslb: max body buffer must be non-negative"))
+			return
+		}
+		t.maxBodyBuffer = size
+	}
 }
 
 // WithNextUpstream sets a custom condition to determine whether a response
@@ -411,12 +449,19 @@ func WithUpstreams(upstreams ...UpstreamConfig) TransportOption {
 
 // Weight sets the server's weight. Higher weight means more traffic.
 func Weight(w int) ServerOption {
-	return func(p *Peer) { p.Weight = w }
+	return func(p *Peer) {
+		p.Weight = w
+		p.weightSet = true
+	}
 }
 
 // MaxFails sets the number of failures before a server is temporarily disabled.
+// An explicit zero disables temporary failure suppression, matching nginx.
 func MaxFails(n int) ServerOption {
-	return func(p *Peer) { p.MaxFails = n }
+	return func(p *Peer) {
+		p.MaxFails = n
+		p.maxFailsSet = true
+	}
 }
 
 // FailTimeout sets the duration a failed server stays disabled.
@@ -444,6 +489,26 @@ func newUpstreamConfig(defaultScheme string) *upstreamConfig {
 		defaultScheme: defaultScheme,
 		addrs:         make(map[*Peer]*backendAddr),
 	}
+}
+
+func (server ServerConfig) validate() error {
+	var err error
+	if server.nilOption {
+		err = errors.Join(err, errors.New("cslb: nil server option"))
+	}
+	if server.Weight < 0 || (server.weightSet && server.Weight == 0) {
+		err = errors.Join(err, errors.New("weight must be greater than zero"))
+	}
+	if server.MaxConns < 0 {
+		err = errors.Join(err, errors.New("max_conns must be non-negative"))
+	}
+	if server.MaxFails < 0 {
+		err = errors.Join(err, errors.New("max_fails must be non-negative"))
+	}
+	if server.FailTimeout < 0 {
+		err = errors.Join(err, errors.New("fail_timeout must be non-negative"))
+	}
+	return err
 }
 
 func (cfg *upstreamConfig) addPeer(peer *Peer, addr string) {
@@ -477,11 +542,25 @@ func (cfg *upstreamConfig) normalize() {
 	if cfg.hashFunc != nil && cfg.algo == AlgoRoundRobin {
 		cfg.algo = AlgoHash
 	}
+	if !supportedAlgorithm(cfg.algo) {
+		cfg.addError(fmt.Errorf("unsupported load-balancing algorithm: %d", cfg.algo))
+		return
+	}
 	if cfg.hashFunc != nil && cfg.algo != AlgoHash && cfg.algo != AlgoHashConsistent {
 		cfg.addError(errors.New("cslb: hash key function can only be used with hash algorithm"))
 	}
 	if (cfg.algo == AlgoHash || cfg.algo == AlgoHashConsistent) && cfg.hashFunc == nil {
 		cfg.addError(errors.New("cslb: hash key function must not be nil"))
+	}
+}
+
+func supportedAlgorithm(algo AlgorithmType) bool {
+	switch algo {
+	case AlgoRoundRobin, AlgoLeastConn, AlgoIPHash, AlgoHash, AlgoRandom,
+		AlgoRandomTwo, AlgoHashConsistent:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -492,6 +571,10 @@ func (t *Transport) registerExplicitUpstream(upstream UpstreamConfig) {
 	cfg.sslName = upstream.SSLName
 
 	for _, server := range upstream.Servers {
+		if err := server.validate(); err != nil {
+			cfg.addError(fmt.Errorf("server %q: %w", server.Address, err))
+			continue
+		}
 		peer := &Peer{
 			Addr:        server.Address,
 			Weight:      server.Weight,
@@ -500,6 +583,8 @@ func (t *Transport) registerExplicitUpstream(upstream UpstreamConfig) {
 			MaxFails:    server.MaxFails,
 			FailTimeout: server.FailTimeout,
 			Backup:      server.Backup,
+			weightSet:   server.weightSet,
+			maxFailsSet: server.maxFailsSet,
 		}
 		cfg.addPeer(peer, server.Address)
 	}
@@ -777,7 +862,11 @@ func (t *Transport) newPicker(ups *upstream, req *http.Request) Picker {
 // Returns a getBody function, an optional cleanup function, and any error.
 func (t *Transport) prepareBody(req *http.Request) (getBody func() (io.ReadCloser, error), cleanup func(), err error) {
 	if req.GetBody != nil {
-		return req.GetBody, nil, nil
+		if req.Body == nil {
+			return req.GetBody, nil, nil
+		}
+		initialBody := req.Body
+		return req.GetBody, func() { initialBody.Close() }, nil
 	}
 
 	if req.Body == nil {
@@ -910,23 +999,31 @@ func (t *Transport) readBody(r io.Reader) ([]byte, *os.File, error) {
 }
 
 // clientIP extracts the client IP from a request, checking X-Real-IP,
-// X-Forwarded-For, and RemoteAddr in order.
+// X-Forwarded-For, and RemoteAddr in order. Client-side outgoing requests
+// usually do not have these values unless the caller sets them explicitly; nil
+// means IPHash will fall back to round-robin selection.
 func clientIP(req *http.Request) net.IP {
-	if ip := req.Header.Get("X-Real-IP"); ip != "" {
-		return net.ParseIP(ip)
+	if value := req.Header.Get("X-Real-IP"); value != "" {
+		if ip := net.ParseIP(strings.TrimSpace(value)); ip != nil {
+			return ip
+		}
 	}
 	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i > 0 {
-			return net.ParseIP(strings.TrimSpace(xff[:i]))
+		if i := strings.IndexByte(xff, ','); i >= 0 {
+			xff = xff[:i]
 		}
-		return net.ParseIP(strings.TrimSpace(xff))
+		if ip := net.ParseIP(strings.TrimSpace(xff)); ip != nil {
+			return ip
+		}
 	}
 	if req.RemoteAddr != "" {
 		host, _, err := net.SplitHostPort(req.RemoteAddr)
 		if err != nil {
-			return net.ParseIP(req.RemoteAddr)
+			host = req.RemoteAddr
 		}
-		return net.ParseIP(host)
+		if ip := net.ParseIP(strings.TrimSpace(host)); ip != nil {
+			return ip
+		}
 	}
 	return nil
 }

@@ -237,6 +237,30 @@ func TestChashPicker_EmptyKeyFallsBackToRR(t *testing.T) {
 	}
 }
 
+func TestChashPicker_DuplicateAddressesUseAllMatchingPeers(t *testing.T) {
+	peers := []*Peer{
+		{Addr: "10.0.0.1:8080", Weight: 1},
+		{Addr: "10.0.0.1:8080", Weight: 1},
+	}
+	balancer := NewHashConsistent(peers)
+
+	counts := map[*Peer]int{}
+	for i := 0; i < 20; i++ {
+		picker := balancer.NewPickerForKey("same-key")
+		peer := picker.Pick()
+		if peer == nil {
+			t.Fatal("Pick returned nil")
+		}
+		counts[peer]++
+		picker.Done(peer, false)
+	}
+
+	if counts[peers[0]] != 10 || counts[peers[1]] != 10 {
+		t.Fatalf("duplicate-address distribution = [%d %d], want [10 10]",
+			counts[peers[0]], counts[peers[1]])
+	}
+}
+
 // TestChashPicker_StabilityOnPeerRemoval is the load-bearing test for this
 // feature. With plain modulo hashing, removing one peer remaps ~75% of keys
 // for a 4-peer setup. Ketama keeps it within ~1/N + variance.

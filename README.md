@@ -11,7 +11,7 @@ All algorithms faithfully follow **nginx**'s upstream implementation.
 ## Features
 
 - **Drop-in replacement** — works as a standard `http.RoundTripper`
-- **6 algorithms** — Round-Robin, Least-Conn, IP-Hash, Key-Hash, Random, Random-Two (Power of Two Choices)
+- **7 algorithms** — Round-Robin, Least-Conn, IP-Hash, Key-Hash, Consistent-Hash, Random, Random-Two (Power of Two Choices)
 - **Nginx-style peer management** — weighted selection, effective weight degradation/recovery, max_fails, fail_timeout, max_conns, backup peers
 - **Automatic failover** — retries failed requests on the next available backend
 - **Configurable retry conditions** — control which HTTP status codes trigger a retry (like nginx's `proxy_next_upstream`)
@@ -73,7 +73,9 @@ func main() {
 upstream-level and server-level configuration, similar to nginx's
 `upstream { server ...; }` blocks.
 For fail-fast validation during construction, use `NewTransportE(...)` and
-handle the returned error.
+handle the returned error. It rejects non-positive explicit weights, negative
+connection/failure limits, negative timeouts or body-buffer sizes, and unknown
+algorithm values.
 
 ## Algorithms
 
@@ -81,10 +83,18 @@ handle the returned error.
 |-----------|-------------|-------------|
 | Round-Robin | `.RoundRobin()` | Smooth weighted round-robin (default) |
 | Least-Conn | `.LeastConn()` | Routes to the peer with fewest active connections |
-| IP-Hash | `.IPHash()` | Consistent hashing by client IP (uses /24 subnet for IPv4) |
+| IP-Hash | `.IPHash()` | Consistent hashing by client IP when the request provides one |
 | Key-Hash | `.Hash(keyFunc)` | CRC32-based hash on an arbitrary request key |
+| Consistent-Hash | `.HashConsistent(keyFunc)` | Ketama-compatible consistent hash with minimal remapping when peers change |
 | Random | `.Random()` | Weighted random selection |
 | Random-Two | `.RandomTwo()` | Power of Two Choices — picks the less loaded of two random peers |
+
+`.IPHash()` extracts the client address from `X-Real-IP`, `X-Forwarded-For`,
+then `RemoteAddr` and uses the IPv4 /24 subnet behavior from nginx. In a normal
+client-side `http.Client`, outgoing requests usually do not have those fields
+unless the caller sets them explicitly; when no client IP is available, IP-Hash
+falls back to Round-Robin. For ordinary client affinity, prefer
+`.Hash(func(*http.Request) string)` and provide the key explicitly.
 
 ## Configuration
 
@@ -121,7 +131,7 @@ into the same variadic option list as individual backends.
 | Option | Description |
 |--------|-------------|
 | `Weight(w)` | Selection weight (default 1) |
-| `MaxFails(n)` | Failures before temporarily disabling (default 1) |
+| `MaxFails(n)` | Failures before temporarily disabling (default 1; 0 disables suppression) |
 | `FailTimeout(d)` | Duration a failed server stays disabled (default 10s) |
 | `MaxConns(n)` | Max concurrent connections (0 = unlimited) |
 | `Backup()` | Only used when all primary backends are unavailable |

@@ -381,6 +381,9 @@ func TestRandomTwo_PrefersLessLoaded(t *testing.T) {
 	}
 
 	t.Logf("random two (one held): held=%s, A=%d B=%d", p1.Addr, counts["A"], counts["B"])
+	if counts[p1.Addr] != 0 {
+		t.Errorf("held peer %s was selected %d times", p1.Addr, counts[p1.Addr])
+	}
 	pk1.Done(p1, false)
 }
 

@@ -48,7 +48,7 @@ func Example_minimal() {
 }
 
 // ----------------------------------------------------------------
-// Example 2: All 6 load balancing algorithms
+// Example 2: All 7 load balancing algorithms
 // ----------------------------------------------------------------
 // Demonstrates how to select a different algorithm for each upstream group.
 func Example_algorithms() {
@@ -91,13 +91,21 @@ func Example_algorithms() {
 				return r.URL.Path // hash by path
 			}),
 
-			// Algorithm 5: Random
+			// Algorithm 5: Ketama-compatible consistent hash
+			cslb.Upstream("http://chash.local",
+				cslb.Server(b1.URL),
+				cslb.Server(b2.URL),
+			).HashConsistent(func(r *http.Request) string {
+				return r.URL.Path
+			}),
+
+			// Algorithm 6: Random
 			cslb.Upstream("http://rand.local",
 				cslb.Server(b1.URL),
 				cslb.Server(b2.URL),
 			).Random(),
 
-			// Algorithm 6: Random two (Power of Two Choices)
+			// Algorithm 7: Random two (Power of Two Choices)
 			// Picks two random backends and selects the one with fewer connections
 			cslb.Upstream("http://rand2.local",
 				cslb.Server(b1.URL),
@@ -109,7 +117,7 @@ func Example_algorithms() {
 	client := &http.Client{Transport: transport}
 
 	// Each upstream group operates independently
-	for _, host := range []string{"rr", "lc", "iphash", "hash", "rand", "rand2"} {
+	for _, host := range []string{"rr", "lc", "iphash", "hash", "chash", "rand", "rand2"} {
 		resp, _ := client.Get("http://" + host + ".local/test")
 		resp.Body.Close()
 		fmt.Printf("%s -> %d\n", host, resp.StatusCode)
@@ -120,6 +128,7 @@ func Example_algorithms() {
 	// lc -> 200
 	// iphash -> 200
 	// hash -> 200
+	// chash -> 200
 	// rand -> 200
 	// rand2 -> 200
 }
@@ -576,7 +585,7 @@ func Example_proxySSLName() {
 			cslb.Upstream("https://api.example.com",
 				// Backend is an IP address — without ProxySSLName, SNI would be the IP
 				cslb.Server(backend.URL),
-			).ProxySSLName("api.example.com"), // Override SNI to the desired hostname
+			).ProxySSLName("example.com"), // Covered by the httptest certificate
 		),
 	)
 
@@ -587,7 +596,7 @@ func Example_proxySSLName() {
 	fmt.Println(string(body))
 
 	// Output:
-	// sni=api.example.com
+	// sni=example.com
 }
 
 // ----------------------------------------------------------------

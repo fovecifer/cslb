@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- GitHub Actions CI covering Go 1.21 and the current stable Go release, with
+  unit tests, `go vet`, race detection, and an 85% coverage floor.
 - `HashConsistent` balancer and `UpstreamConfig.HashConsistent(keyFunc)`
   option implementing ketama-style consistent hashing. Mirrors nginx's
   `hash <key> consistent`. Ring construction is byte-compatible with
@@ -17,8 +19,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   any standard ketama client configured against the same backends. On
   peer removal only ~1/N of keys remap instead of nearly all of them.
 
+### Changed
+
+- Clarified that IP-Hash only has a client IP in client-side usage when the
+  caller provides `X-Real-IP`, `X-Forwarded-For`, or `RemoteAddr`; otherwise it
+  falls back to Round-Robin, and explicit `Hash` keys are preferred for ordinary
+  client affinity.
+- Refactored hash, consistent-hash, IP-hash, and random fallback paths to call
+  Round-Robin without relocking solely to satisfy deferred unlocks.
+
 ### Fixed
 
+- Explicit `MaxFails(0)` now disables temporary failure suppression while an
+  omitted value continues to default to 1.
+- Invalid server and transport settings, unknown algorithms, and nil options
+  now surface as `NewTransportE` construction errors instead of being silently
+  normalized or causing a panic.
+- Plain Hash, IP-Hash, Least-Conn tie-breaking, and Random-Two selection now
+  follow nginx's actual hash iteration and peer-selection behavior.
+- Consistent-Hash ring points now balance across all peers with the same server
+  address instead of permanently selecting the first duplicate entry.
+- Requests with a caller-provided `GetBody` now close the original request body
+  after the load-balanced attempt completes.
+- Malformed `X-Real-IP` or `X-Forwarded-For` values no longer prevent IP-Hash
+  from checking the next configured client-address source.
 - Backup peers are no longer retried more than once in the same request after
   falling back from the primary peer group.
 - Duplicate upstream registrations for the same scheme and host now fail fast

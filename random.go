@@ -1,6 +1,9 @@
 package cslb
 
-import "math/rand"
+import (
+	"math/rand"
+	"time"
+)
 
 // ---------- Random Balancer ----------
 // Corresponds to nginx's ngx_http_upstream_random_module.c
@@ -72,9 +75,9 @@ func (r *Random) NewPicker() Picker {
 //	} ngx_http_upstream_random_peer_data_t;
 
 type randomPicker struct {
-	*RRPicker              // embedded RR
-	balancer *Random       // reference to balancer config
-	tries    int
+	*RRPicker         // embedded RR
+	balancer  *Random // reference to balancer config
+	tries     int
 }
 
 // Pick selects a peer randomly.
@@ -91,16 +94,14 @@ func (p *randomPicker) Pick() *Peer {
 func (p *randomPicker) pickOne() *Peer {
 	group := p.PrimaryGroup()
 
-	if len(group.Peers) == 0 {
-		return nil
+	if len(group.Peers) < 2 {
+		return p.RRPicker.Pick()
 	}
 
 	group.mu.Lock()
-	defer group.mu.Unlock()
+	now := time.Now()
 
-	for p.tries < maxRandomTries {
-		p.tries++
-
+	for p.tries <= maxRandomTries {
 		// nginx: i = ngx_random() % peers->total_weight
 		// then binary search in ranges
 		peer := p.randomSelect(group)
@@ -109,17 +110,20 @@ func (p *randomPicker) pickOne() *Peer {
 		}
 
 		if !peer.Down && !p.Tried(peer) && peerAvailable(peer) {
+			if now.Sub(peer.checked) > peer.FailTimeout {
+				peer.checked = now
+			}
 			peer.conns++
 			p.SetTried(peer)
+			group.mu.Unlock()
 			return peer
 		}
+
+		p.tries++
 	}
 
-	// Fallback to round-robin
 	group.mu.Unlock()
-	result := p.RRPicker.Pick()
-	group.mu.Lock()
-	return result
+	return p.RRPicker.Pick()
 }
 
 // pickTwo implements Power of Two Choices.
@@ -127,60 +131,46 @@ func (p *randomPicker) pickOne() *Peer {
 func (p *randomPicker) pickTwo() *Peer {
 	group := p.PrimaryGroup()
 
-	if len(group.Peers) == 0 {
-		return nil
+	if len(group.Peers) < 2 {
+		return p.RRPicker.Pick()
 	}
 
 	group.mu.Lock()
-	defer group.mu.Unlock()
+	now := time.Now()
+	var previous *Peer
 
-	for p.tries < maxRandomTries {
-		p.tries++
-
-		// Pick two random peers
-		peer1 := p.randomSelect(group)
-		peer2 := p.randomSelect(group)
-
-		if peer1 == nil || peer2 == nil {
+	for p.tries <= maxRandomTries {
+		peer := p.randomSelect(group)
+		if peer == nil {
 			break
 		}
 
-		// Skip unavailable peers
-		if peer1.Down || !peerAvailable(peer1) {
-			peer1 = nil
-		}
-		if peer2.Down || !peerAvailable(peer2) {
-			peer2 = nil
-		}
-
-		// nginx (line 397): compare weighted connections
-		// peer->conns * prev->weight > prev->conns * peer->weight
-		var selected *Peer
-		switch {
-		case peer1 == nil && peer2 == nil:
+		if peer == previous || p.Tried(peer) || peer.Down || !peerAvailable(peer) {
+			p.tries++
 			continue
-		case peer1 == nil:
-			selected = peer2
-		case peer2 == nil:
-			selected = peer1
-		case peer2.conns*peer1.Weight < peer1.conns*peer2.Weight:
-			selected = peer2
-		default:
-			selected = peer1
 		}
 
-		if selected != nil && !p.Tried(selected) {
-			selected.conns++
-			p.SetTried(selected)
-			return selected
+		if previous == nil {
+			previous = peer
+			p.tries++
+			continue
 		}
+
+		selected := peer
+		if peer.conns*previous.Weight > previous.conns*peer.Weight {
+			selected = previous
+		}
+		if now.Sub(selected.checked) > selected.FailTimeout {
+			selected.checked = now
+		}
+		selected.conns++
+		p.SetTried(selected)
+		group.mu.Unlock()
+		return selected
 	}
 
-	// Fallback to round-robin
 	group.mu.Unlock()
-	result := p.RRPicker.Pick()
-	group.mu.Lock()
-	return result
+	return p.RRPicker.Pick()
 }
 
 // randomSelect picks a random peer weighted by configured weights.

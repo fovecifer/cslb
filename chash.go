@@ -5,6 +5,7 @@ import (
 	"hash/crc32"
 	"sort"
 	"strings"
+	"time"
 )
 
 // ---------- Consistent (ketama) Hash Balancer ----------
@@ -96,24 +97,47 @@ func (p *chashPicker) Pick() *Peer {
 
 	group := p.PrimaryGroup()
 	group.mu.Lock()
-	defer group.mu.Unlock()
+	now := time.Now()
 
-	for p.tries < maxHashTries {
-		peer := points[(p.cursor+p.tries)%len(points)].peer
-		p.tries++
-		if !peer.Down && !p.Tried(peer) && peerAvailable(peer) {
-			peer.conns++
-			p.SetTried(peer)
-			return peer
+	for p.tries <= maxHashTries {
+		// Ring points identify an nginx server entry. Multiple peers may share
+		// that server string, so choose among matching peers with smooth
+		// weighted round-robin instead of pinning the point to one Peer pointer.
+		server := points[(p.cursor+p.tries)%len(points)].peer.Addr
+		var best *Peer
+		total := 0
+		for _, peer := range group.Peers {
+			if peer.Addr != server || peer.Down || p.Tried(peer) || !peerAvailable(peer) {
+				continue
+			}
+			peer.currentWeight += peer.effectiveWeight
+			total += peer.effectiveWeight
+			if peer.effectiveWeight < peer.Weight {
+				peer.effectiveWeight++
+			}
+			if best == nil || peer.currentWeight > best.currentWeight {
+				best = peer
+			}
 		}
+
+		if best != nil {
+			best.currentWeight -= total
+			if now.Sub(best.checked) > best.FailTimeout {
+				best.checked = now
+			}
+			best.conns++
+			p.SetTried(best)
+			group.mu.Unlock()
+			return best
+		}
+
+		p.tries++
 	}
 
 	// Fallback to round-robin once the ring has exhausted its budget,
 	// matching nginx's hp->tries > 20 fallback to hp->get_rr_peer.
 	group.mu.Unlock()
-	result := p.RRPicker.Pick()
-	group.mu.Lock()
-	return result
+	return p.RRPicker.Pick()
 }
 
 // Done delegates to the embedded RR picker.

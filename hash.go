@@ -1,6 +1,10 @@
 package cslb
 
-import "hash/crc32"
+import (
+	"hash/crc32"
+	"strconv"
+	"time"
+)
 
 // ---------- Hash Balancer ----------
 // Corresponds to nginx's ngx_http_upstream_hash_module.c
@@ -48,9 +52,11 @@ func (h *Hash) NewPickerForKey(key string) Picker {
 //	} ngx_http_upstream_hash_peer_data_t;
 
 type hashPicker struct {
-	*RRPicker          // embedded RR (nginx: rrp first field)
-	key       string   // hash key (evaluated from request)
-	hashTries int      // number of hash attempts
+	*RRPicker        // embedded RR (nginx: rrp first field)
+	key       string // hash key (evaluated from request)
+	hashTries int    // number of rejected hash candidates
+	rehash    int    // decimal retry prefix used by nginx
+	hash      uint32 // cumulative nginx hash value
 }
 
 // Pick selects a peer by hashing the key.
@@ -58,22 +64,26 @@ type hashPicker struct {
 func (p *hashPicker) Pick() *Peer {
 	group := p.PrimaryGroup()
 
-	// Empty key or no peers → fall back to round-robin
-	if p.key == "" || len(group.Peers) == 0 {
+	// Empty keys and single-peer groups use the round-robin fast path in nginx.
+	if p.key == "" || len(group.Peers) < 2 {
 		return p.RRPicker.Pick()
 	}
 
 	group.mu.Lock()
-	defer group.mu.Unlock()
+	now := time.Now()
 
-	// nginx: hash = crc32(key)
-	hash := crc32.ChecksumIEEE([]byte(p.key))
+	for p.hashTries <= maxHashTries {
+		// nginx and Cache::Memcached compatibility:
+		// ((crc32([REHASH] KEY) >> 16) & 0x7fff) + PREV_HASH.
+		input := p.key
+		if p.rehash > 0 {
+			input = strconv.Itoa(p.rehash) + p.key
+		}
+		hash := crc32.ChecksumIEEE([]byte(input))
+		p.hash += (hash >> 16) & 0x7fff
+		p.rehash++
 
-	for p.hashTries < maxHashTries {
-		p.hashTries++
-
-		// nginx: w = hash % total_weight, then walk peers
-		w := int(hash % uint32(group.TotalWeight))
+		w := int(p.hash % uint32(group.TotalWeight))
 
 		var selected *Peer
 		for _, peer := range group.Peers {
@@ -89,22 +99,20 @@ func (p *hashPicker) Pick() *Peer {
 		}
 
 		if !selected.Down && !p.Tried(selected) && peerAvailable(selected) {
+			if now.Sub(selected.checked) > selected.FailTimeout {
+				selected.checked = now
+			}
 			selected.conns++
 			p.SetTried(selected)
+			group.mu.Unlock()
 			return selected
 		}
 
-		// nginx: hash = (hash + 113) rehash
-		hash += 113
+		p.hashTries++
 	}
 
 	group.mu.Unlock()
-
-	// Fallback to round-robin (nginx: hp->get_rr_peer)
-	result := p.RRPicker.Pick()
-
-	group.mu.Lock()
-	return result
+	return p.RRPicker.Pick()
 }
 
 // Done delegates to the embedded RR picker.

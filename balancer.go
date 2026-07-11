@@ -12,9 +12,10 @@
 //	Layer 2: Picker        (init_peer)      — per-request selection context
 //	Layer 3: Pick / Done   (get / free)     — select peer, report result
 //
-// Supported algorithms: Round-Robin, Least-Conn, IP-Hash, Hash, Random,
-// Random-Two (Power of Two Choices). All algorithms wrap RoundRobin as a
-// base layer, matching nginx's decorator pattern.
+// Supported algorithms: Round-Robin, Least-Conn, IP-Hash, Hash,
+// Hash-Consistent, Random, and Random-Two (Power of Two Choices). All
+// algorithms wrap RoundRobin as a base layer, matching nginx's decorator
+// pattern.
 package cslb
 
 import (
@@ -37,6 +38,11 @@ type Peer struct {
 
 	Backup bool // if true, only used when all primary peers fail
 
+	// Configuration presence flags distinguish an omitted zero value from an
+	// explicit nginx-compatible zero supplied through a ServerOption.
+	weightSet   bool
+	maxFailsSet bool
+
 	// Mutable state — protected by PeerGroup.mu
 	currentWeight   int
 	effectiveWeight int
@@ -50,7 +56,7 @@ func (p *Peer) init() {
 	if p.Weight <= 0 {
 		p.Weight = 1
 	}
-	if p.MaxFails == 0 {
+	if p.MaxFails == 0 && !p.maxFailsSet {
 		p.MaxFails = 1
 	}
 	if p.FailTimeout == 0 {

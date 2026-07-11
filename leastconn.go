@@ -52,7 +52,7 @@ func (p *leastConnPicker) pickFromGroup(group *PeerGroup) *Peer {
 
 	now := time.Now()
 	var best *Peer
-	total := 0
+	many := false
 
 	for _, peer := range group.Peers {
 		if p.Tried(peer) {
@@ -79,22 +79,9 @@ func (p *leastConnPicker) pickFromGroup(group *PeerGroup) *Peer {
 		if best == nil ||
 			peer.conns*best.Weight < best.conns*peer.Weight {
 			best = peer
-			total = peer.effectiveWeight
-			// Reset RR state for tie-breaking
-			best.currentWeight = best.effectiveWeight
+			many = false
 		} else if peer.conns*best.Weight == best.conns*peer.Weight {
-			// Tie: use weighted round-robin to break it
-			// (nginx lines 175-186: same logic as RR core)
-			peer.currentWeight += peer.effectiveWeight
-			total += peer.effectiveWeight
-
-			if peer.effectiveWeight < peer.Weight {
-				peer.effectiveWeight++
-			}
-
-			if peer.currentWeight > best.currentWeight {
-				best = peer
-			}
+			many = true
 		}
 	}
 
@@ -102,8 +89,39 @@ func (p *leastConnPicker) pickFromGroup(group *PeerGroup) *Peer {
 		return nil
 	}
 
-	// Same as RR: subtract total from winner
-	best.currentWeight -= total
+	if many {
+		// Match nginx's second pass: only peers tied at the minimum normalized
+		// connection count participate in smooth weighted round-robin.
+		least := best
+		best = nil
+		total := 0
+		for _, peer := range group.Peers {
+			if p.Tried(peer) || peer.Down {
+				continue
+			}
+			if peer.conns*least.Weight != least.conns*peer.Weight {
+				continue
+			}
+			if peer.MaxFails > 0 &&
+				peer.fails >= peer.MaxFails &&
+				now.Sub(peer.checked) <= peer.FailTimeout {
+				continue
+			}
+			if peer.MaxConns > 0 && peer.conns >= peer.MaxConns {
+				continue
+			}
+
+			peer.currentWeight += peer.effectiveWeight
+			total += peer.effectiveWeight
+			if peer.effectiveWeight < peer.Weight {
+				peer.effectiveWeight++
+			}
+			if best == nil || peer.currentWeight > best.currentWeight {
+				best = peer
+			}
+		}
+		best.currentWeight -= total
+	}
 
 	if now.Sub(best.checked) > best.FailTimeout {
 		best.checked = now
