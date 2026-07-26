@@ -19,7 +19,7 @@ execution model has deliberate differences, documented below.
 - **Nginx-aligned failover defaults** — retries transport errors/timeouts; HTTP status retries are opt-in
 - **Configurable retry conditions** — control which HTTP status codes trigger a retry (like nginx's `proxy_next_upstream`)
 - **Non-idempotent safety gate** — sent `POST`, `LOCK`, and `PATCH` requests are not retried unless explicitly enabled
-- **Request body replay** — supports `GetBody`, seekable bodies, and memory/temp-file buffering when retries are enabled
+- **Request body replay** — supports `GetBody`, seekable bodies, and memory/temp-file buffering when replay may be needed
 - **Per-attempt timeout** — each backend attempt gets its own timeout
 - **Scheme rewriting** — HTTP frontend can route to HTTPS backends (or mixed)
 - **Host header preservation** — original Host is preserved when rewriting
@@ -113,7 +113,9 @@ upstream-level and server-level configuration, similar to nginx's
 For fail-fast validation during construction, use `NewTransportE(...)` and
 handle the returned error. It rejects non-positive explicit weights, negative
 connection/failure limits, negative timeouts or body-buffer sizes, and unknown
-algorithm values.
+algorithm values. It also rejects nil custom transports or retry conditions and
+upstreams whose servers are all marked `Down()`. An upstream containing only
+usable backup servers remains valid.
 
 ## Runnable Examples
 
@@ -155,7 +157,7 @@ falls back to Round-Robin. For ordinary client affinity, prefer
 | `WithRoundTripper(rt)` | Use a custom `http.RoundTripper` as the underlying transport |
 | `WithTimeout(d)` | Per-attempt request timeout |
 | `WithConnectTimeout(d)` | TCP connect timeout (ignored with custom RoundTripper) |
-| `WithMaxBodyBuffer(size)` | Max body size buffered in memory for retries (default 32MB) |
+| `WithMaxBodyBuffer(size)` | Max body size buffered in memory for retries; 0 always spills non-empty bodies (default 32MB) |
 | `WithNextUpstream(cond)` | Custom retry condition function |
 | `WithNextUpstreamCodes(codes...)` | Retry on specific HTTP status codes |
 | `WithNonIdempotentRetries()` | Allow sent `POST`/`LOCK`/`PATCH` requests to retry; may duplicate side effects |
@@ -260,12 +262,19 @@ effective weight, matching nginx.
 
 ## Request Body Buffering
 
-Retryable bodies use the request's `GetBody` callback when available, then a
-seekable-body fast path, then memory/temp-file buffering. `WithMaxBodyBuffer`
-is the in-memory threshold, not a total request-size limit. Bodies above it
-spill to a temporary file, and the temporary file currently has no library
-level size cap. Applications accepting untrusted or very large uploads should
-enforce their own request-size limit.
+Bodies that may need replay use the request's `GetBody` callback when
+available, then a seekable-body fast path, then memory/temp-file buffering.
+Genuinely streaming bodies are not read ahead when an upstream has only one
+usable server, or when the default non-idempotent gate makes a sent `POST`,
+`LOCK`, or `PATCH` terminal. A connection failure before a standard
+`*http.Transport` writes the request can still fail over without consuming the
+stream.
+
+`WithMaxBodyBuffer` is the in-memory threshold, not a total request-size limit.
+Setting it to zero sends every non-empty buffered body directly to a temporary
+file. Bodies above the configured threshold spill to a temporary file, and the
+temporary file currently has no library-level size cap. Applications accepting
+untrusted or very large uploads should enforce their own request-size limit.
 
 ## TLS Server Name
 

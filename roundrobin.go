@@ -39,6 +39,20 @@ type RRPicker struct {
 	backup      *PeerGroup
 	tried       map[*Peer]bool // nginx uses a bitmap; Go map is cleaner
 	backupPhase bool
+
+	// probeChecked records the checked timestamps this picker advanced in
+	// commitPeer, so a neutral release can put them back.
+	probeChecked map[*Peer]probeCheck
+}
+
+// probeCheck remembers one advanced checked timestamp: prior is the value to
+// restore, seq is the peer's version counter immediately after this picker
+// wrote it. Comparing seq lets a neutral release detect that a concurrent
+// request has since recorded a real outcome and leave that newer, authoritative
+// timestamp alone.
+type probeCheck struct {
+	prior time.Time
+	seq   uint64
 }
 
 // NewRRPicker creates a round-robin picker.
@@ -176,7 +190,17 @@ func smoothWeightedPeer(peers []*Peer, eligible func(*Peer) bool) *Peer {
 // helper because nginx does not update checked in that path.
 func (rr *RRPicker) commitPeer(peer *Peer, now time.Time) *Peer {
 	if now.Sub(peer.checked) > peer.FailTimeout {
-		peer.checked = now
+		// Advancing checked starts this peer's recovery probe: while it is set
+		// to now, a peer at max_fails is skipped by everyone else. Remember the
+		// previous value so a neutral release can hand the probe back instead
+		// of quarantining the peer for another fail_timeout over an attempt
+		// that never reached it.
+		if rr.probeChecked == nil {
+			rr.probeChecked = make(map[*Peer]probeCheck, 1)
+		}
+		prior := peer.checked
+		peer.setChecked(now)
+		rr.probeChecked[peer] = probeCheck{prior: prior, seq: peer.checkedSeq}
 	}
 	peer.conns++
 	rr.SetTried(peer)
@@ -201,17 +225,10 @@ func (rr *RRPicker) done(peer *Peer, failed bool, neutral bool) {
 		return
 	}
 
-	// Determine which group owns this peer
 	group := rr.primary
-	for _, p := range rr.primary.Peers {
-		if p == peer {
-			goto found
-		}
-	}
-	if rr.backup != nil {
+	if peer.Backup && rr.backup != nil {
 		group = rr.backup
 	}
-found:
 
 	group.mu.Lock()
 	defer group.mu.Unlock()
@@ -222,6 +239,19 @@ found:
 		return
 	}
 	if neutral {
+		// This attempt said nothing about the upstream, so give back the
+		// recovery probe that selection consumed. Without this a peer whose
+		// fail_timeout had just elapsed would be re-quarantined for another
+		// full window by a caller cancellation or a local defect.
+		if probe, ok := rr.probeChecked[peer]; ok {
+			// Roll back only if no one has written checked since this picker
+			// did. A concurrent request may have recorded a real failure in the
+			// meantime, and that outcome outranks our missing one.
+			if peer.checkedSeq == probe.seq {
+				peer.setChecked(probe.prior)
+			}
+			delete(rr.probeChecked, peer)
+		}
 		peer.conns--
 		return
 	}
@@ -232,7 +262,7 @@ found:
 		// nginx lines 819-841
 		peer.fails++
 		peer.accessed = now
-		peer.checked = now
+		peer.setChecked(now)
 
 		if peer.MaxFails > 0 {
 			peer.effectiveWeight -= peer.Weight / peer.MaxFails

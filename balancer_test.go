@@ -348,14 +348,17 @@ func TestRandom_Distribution(t *testing.T) {
 		{Addr: "C", Weight: 1},
 	}
 	b := NewRandom(peers)
+	next := 0
+	b.intn = func(n int) int {
+		value := next % n
+		next++
+		return value
+	}
 
 	counts := pickN(t, b, 3000)
-	t.Logf("random: A=%d B=%d C=%d", counts["A"], counts["B"], counts["C"])
-
-	// Each should get roughly 1000 (within 30% tolerance)
 	for _, addr := range []string{"A", "B", "C"} {
-		if counts[addr] < 700 || counts[addr] > 1300 {
-			t.Errorf("%s=%d, outside expected range [700,1300]", addr, counts[addr])
+		if counts[addr] != 1000 {
+			t.Errorf("%s=%d, want 1000", addr, counts[addr])
 		}
 	}
 }
@@ -366,6 +369,12 @@ func TestRandomTwo_PrefersLessLoaded(t *testing.T) {
 		{Addr: "B", Weight: 1},
 	}
 	b := NewRandomTwo(peers)
+	next := 0
+	b.intn = func(n int) int {
+		value := next % n
+		next++
+		return value
+	}
 
 	// Hold a connection on one peer
 	pk1 := b.NewPicker()

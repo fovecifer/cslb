@@ -198,17 +198,26 @@ func TestTransport_NonIdempotentConnectFailureBeforeSendRetries(t *testing.T) {
 	)
 
 	client := &http.Client{Transport: transport}
-	resp, err := client.Post(
-		"http://connect-before-send.local/test",
-		"text/plain",
-		strings.NewReader("payload"),
-	)
+	body := newTrackingBody("payload")
+	req, err := http.NewRequest(http.MethodPost, "http://connect-before-send.local/test", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "text/plain")
+
+	// trackingBody deliberately has no GetBody or Seek method. The first
+	// transport attempt must leave this stream untouched when dialing fails
+	// before any request bytes are written, so the second peer receives it.
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if !body.closed {
+		t.Fatal("streaming request body was not closed")
 	}
 }
 

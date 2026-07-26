@@ -892,6 +892,305 @@ func TestTransport_InvalidUnderlyingRoundTrip(t *testing.T) {
 	}
 }
 
+// A RoundTripper is required to return a non-nil Body, but a custom or test
+// implementation may not. The retry path closes the previous attempt's body
+// before committing to the next peer, so a nil Body must surface as an error
+// rather than crashing the library.
+func TestTransport_NilResponseBodyOnRetry(t *testing.T) {
+	transport := NewTransport(
+		WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{}}, nil
+		})),
+		WithUpstreams(Upstream("http://nilbody.local",
+			Server("http://10.0.0.1:8080"),
+			Server("http://10.0.0.2:8080"),
+		)),
+		WithNextUpstreamCodes(http.StatusServiceUnavailable),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "http://nilbody.local/test", nil)
+	resp, err := transport.RoundTrip(req)
+	if resp != nil {
+		t.Fatal("expected no response when the underlying transport violates the Body contract")
+	}
+	if !errors.Is(err, ErrNilResponseBody) {
+		t.Fatalf("got %v, want %v", err, ErrNilResponseBody)
+	}
+}
+
+// A RoundTripper contract violation is a local defect, not a statement about
+// upstream health. It must not be fanned out across the pool and must not
+// degrade any peer's failure counters or effective weight.
+func TestTransport_RoundTripperContractViolationDoesNotPenalizePeers(t *testing.T) {
+	tests := []struct {
+		name    string
+		respond func() (*http.Response, error)
+		wantErr error
+	}{
+		{
+			name:    "nil body",
+			respond: func() (*http.Response, error) { return &http.Response{StatusCode: 200, Header: http.Header{}}, nil },
+			wantErr: ErrNilResponseBody,
+		},
+		{
+			name:    "nil response and nil error",
+			respond: func() (*http.Response, error) { return nil, nil },
+			wantErr: ErrInvalidRoundTrip,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			attempts := 0
+			transport := NewTransport(
+				WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					attempts++
+					return test.respond()
+				})),
+				WithUpstreams(Upstream("http://contract.local",
+					Server("http://10.0.0.1:8080", Weight(10)),
+					Server("http://10.0.0.2:8080", Weight(10)),
+					Server("http://10.0.0.3:8080", Weight(10)),
+				)),
+			)
+
+			req := httptest.NewRequest(http.MethodGet, "http://contract.local/test", nil)
+			resp, err := transport.RoundTrip(req)
+			if resp != nil {
+				t.Fatal("expected no response for a contract violation")
+			}
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("got %v, want %v", err, test.wantErr)
+			}
+			// Retry behaviour is unchanged: the default condition retries any
+			// transport error across the pool. Only peer health is protected.
+			if attempts != 3 {
+				t.Fatalf("attempts = %d, want 3 (default retry semantics must be preserved)", attempts)
+			}
+
+			rr := transport.upstreams[upstreamKey{scheme: "http", host: "contract.local"}].balancer.(*RoundRobin)
+			for i, peer := range rr.primary.Peers {
+				if peer.fails != 0 {
+					t.Errorf("peer %d fails = %d, want 0", i, peer.fails)
+				}
+				if peer.effectiveWeight != peer.Weight {
+					t.Errorf("peer %d effective weight = %d, want %d", i, peer.effectiveWeight, peer.Weight)
+				}
+				if peer.conns != 0 {
+					t.Errorf("peer %d conns = %d, want 0 (peer must be released)", i, peer.conns)
+				}
+			}
+		})
+	}
+}
+
+// A contract violation must be neutral for peer health, not a success. Reporting
+// success would run nginx's recovery path and clear the failure counter of a peer
+// that is still recovering, based on an attempt that never reached the upstream.
+func TestTransport_ContractViolationDoesNotHealRecoveringPeer(t *testing.T) {
+	transport := NewTransport(
+		WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Header: http.Header{}}, nil
+		})),
+		WithUpstreams(Upstream("http://healing.local",
+			Server("http://10.0.0.1:8080", Weight(10), MaxFails(2)),
+			// A second, permanently down server keeps the group off the
+			// single-peer fast path, which ignores health counters entirely.
+			Server("http://10.0.0.2:8080", Down()),
+		)),
+	)
+
+	rr := transport.upstreams[upstreamKey{scheme: "http", host: "healing.local"}].balancer.(*RoundRobin)
+	peer := rr.primary.Peers[0]
+
+	// Put the peer in the state nginx treats as "recovering": it failed a while
+	// ago (accessed) and has since been re-checked, so the next *successful*
+	// attempt would legitimately clear its failure counter.
+	peer.fails = 1
+	peer.effectiveWeight = 5
+	peer.accessed = time.Now().Add(-time.Hour)
+	peer.checked = time.Now().Add(-time.Minute)
+
+	req := httptest.NewRequest(http.MethodGet, "http://healing.local/test", nil)
+	if _, err := transport.RoundTrip(req); !errors.Is(err, ErrNilResponseBody) {
+		t.Fatalf("got %v, want %v", err, ErrNilResponseBody)
+	}
+
+	if peer.fails != 1 {
+		t.Fatalf("fails = %d, want 1 (a local defect must not heal a recovering peer)", peer.fails)
+	}
+	// Selection legitimately nudges effective weight back up by one per pass
+	// (nginx's gradual recovery in the smooth-WRR core), so the invariant is
+	// that the attempt did not *degrade* it. The failure path would have
+	// applied effectiveWeight -= Weight/MaxFails, i.e. 5 - 10/2 = 0.
+	if peer.effectiveWeight < 5 {
+		t.Fatalf("effective weight = %d, want >= 5 (a local defect must not degrade the peer)", peer.effectiveWeight)
+	}
+	if peer.conns != 0 {
+		t.Fatalf("conns = %d, want 0 (peer must still be released)", peer.conns)
+	}
+}
+
+// quarantineElapsed puts the upstream's first peer in the state where it has
+// exhausted max_fails but its fail_timeout has elapsed, so the next selection
+// is its recovery probe. The second peer is permanently down, both to keep the
+// group off the single-peer fast path (which ignores health entirely) and to
+// make "probe lost" observable as ErrNoPeerAvailable.
+func quarantineElapsed(t *testing.T, transport *Transport, host string) *Peer {
+	t.Helper()
+	rr := transport.upstreams[upstreamKey{scheme: "http", host: host}].balancer.(*RoundRobin)
+	peer := rr.primary.Peers[0]
+	peer.fails = 1
+	peer.accessed = time.Now().Add(-time.Hour)
+	peer.checked = time.Now().Add(-time.Hour)
+	return peer
+}
+
+// Selecting a peer whose fail_timeout has elapsed starts its recovery probe by
+// advancing checked, which makes every other request skip it. A neutral release
+// must hand that probe back, or an attempt that never reached the upstream
+// quarantines the peer for another full fail_timeout.
+func TestTransport_ContractViolationPreservesRecoveryProbe(t *testing.T) {
+	healthy := false
+	transport := NewTransport(
+		WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if healthy {
+				return &http.Response{StatusCode: 200, Body: http.NoBody, Header: http.Header{}}, nil
+			}
+			return &http.Response{StatusCode: 200, Header: http.Header{}}, nil // nil Body
+		})),
+		WithUpstreams(Upstream("http://probe.local",
+			Server("http://10.0.0.1:8080", MaxFails(1)),
+			Server("http://10.0.0.2:8080", Down()),
+		)),
+	)
+	quarantineElapsed(t, transport, "probe.local")
+
+	req := httptest.NewRequest(http.MethodGet, "http://probe.local/x", nil)
+	if _, err := transport.RoundTrip(req); !errors.Is(err, ErrNilResponseBody) {
+		t.Fatalf("setup: got %v, want %v", err, ErrNilResponseBody)
+	}
+
+	healthy = true
+	resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodGet, "http://probe.local/x", nil))
+	if err != nil {
+		t.Fatalf("peer was re-quarantined by an attempt that never reached it: %v", err)
+	}
+	resp.Body.Close()
+}
+
+// The same guarantee for the pre-existing neutral path: a caller cancelling its
+// request must not cost the peer its recovery probe.
+func TestTransport_CancellationPreservesRecoveryProbe(t *testing.T) {
+	var cancel context.CancelFunc
+	cancelNext := true
+	transport := NewTransport(
+		WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if cancelNext {
+				cancel()
+				return nil, context.Canceled
+			}
+			return &http.Response{StatusCode: 200, Body: http.NoBody, Header: http.Header{}}, nil
+		})),
+		WithUpstreams(Upstream("http://cancelprobe.local",
+			Server("http://10.0.0.1:8080", MaxFails(1)),
+			Server("http://10.0.0.2:8080", Down()),
+		)),
+	)
+	quarantineElapsed(t, transport, "cancelprobe.local")
+
+	ctx, c := context.WithCancel(context.Background())
+	cancel = c
+	defer c()
+
+	req := httptest.NewRequest(http.MethodGet, "http://cancelprobe.local/x", nil).WithContext(ctx)
+	if _, err := transport.RoundTrip(req); !errors.Is(err, context.Canceled) {
+		t.Fatalf("setup: got %v, want %v", err, context.Canceled)
+	}
+
+	cancelNext = false
+	resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodGet, "http://cancelprobe.local/x", nil))
+	if err != nil {
+		t.Fatalf("peer was re-quarantined by a cancelled request: %v", err)
+	}
+	resp.Body.Close()
+}
+
+// Protecting peer health from a RoundTripper defect must not seize control of
+// the retry decision: WithNextUpstream is documented as being consulted after
+// every attempt, including this one.
+func TestTransport_ContractViolationStillHonorsNextUpstream(t *testing.T) {
+	attempts := 0
+	var sawErr error
+	transport := NewTransport(
+		WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			attempts++
+			return &http.Response{StatusCode: 200, Header: http.Header{}}, nil
+		})),
+		WithUpstreams(Upstream("http://contract-cond.local",
+			Server("http://10.0.0.1:8080"),
+			Server("http://10.0.0.2:8080"),
+			Server("http://10.0.0.3:8080"),
+		)),
+		WithNextUpstream(func(resp *http.Response, err error) bool {
+			sawErr = err
+			return false // caller declines to fail over
+		}),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "http://contract-cond.local/test", nil)
+	if _, err := transport.RoundTrip(req); !errors.Is(err, ErrNilResponseBody) {
+		t.Fatalf("got %v, want %v", err, ErrNilResponseBody)
+	}
+	if !errors.Is(sawErr, ErrNilResponseBody) {
+		t.Fatalf("condition saw %v, want it to be consulted with %v", sawErr, ErrNilResponseBody)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 (the condition declined to retry)", attempts)
+	}
+}
+
+// With a per-attempt timeout the response body is wrapped in a cancelCloser, so
+// a nil Body must be rejected before wrapping or the caller's Close panics.
+func TestTransport_NilResponseBodyWithTimeout(t *testing.T) {
+	transport := NewTransport(
+		WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}}, nil
+		})),
+		WithUpstreams(Upstream("http://nilbody.local",
+			Server("http://10.0.0.1:8080"),
+		)),
+		WithTimeout(time.Second),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "http://nilbody.local/test", nil)
+	resp, err := transport.RoundTrip(req)
+	if resp != nil {
+		t.Fatal("expected no response when the underlying transport violates the Body contract")
+	}
+	if !errors.Is(err, ErrNilResponseBody) {
+		t.Fatalf("got %v, want %v", err, ErrNilResponseBody)
+	}
+}
+
+// The pass-through path for unmatched upstreams applies the same contract check.
+func TestTransport_NilResponseBodyPassThrough(t *testing.T) {
+	transport := NewTransport(
+		WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}}, nil
+		})),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "http://unmatched.local/test", nil)
+	resp, err := transport.RoundTrip(req)
+	if resp != nil {
+		t.Fatal("expected no response when the underlying transport violates the Body contract")
+	}
+	if !errors.Is(err, ErrNilResponseBody) {
+		t.Fatalf("got %v, want %v", err, ErrNilResponseBody)
+	}
+}
+
 func TestTransport_RoundTripDoesNotMutateOriginalRequest(t *testing.T) {
 	const payload = "payload"
 	originalBody := newTrackingBody(payload)
@@ -944,8 +1243,8 @@ func TestTransport_RoundTripDoesNotMutateOriginalRequest(t *testing.T) {
 	if gotBody != payload {
 		t.Fatalf("attempt body = %q, want %q", gotBody, payload)
 	}
-	if gotContentLength != int64(len(payload)) {
-		t.Fatalf("attempt ContentLength = %d, want %d", gotContentLength, len(payload))
+	if gotContentLength != originalContentLength {
+		t.Fatalf("attempt ContentLength = %d, want streaming value %d", gotContentLength, originalContentLength)
 	}
 	if req.URL != originalURL || req.URL.String() != originalURLString {
 		t.Fatalf("original URL mutated to %q, want %q", req.URL.String(), originalURLString)
@@ -1070,22 +1369,51 @@ func TestTransport_AllPeersFailReturnsLast(t *testing.T) {
 	}
 }
 
-func TestTransport_NoPeerAvailable(t *testing.T) {
-	// All configured peers are marked Down — Pick() returns nil on the
-	// first attempt and we expect an explicit ErrNoPeerAvailable rather
-	// than a misleading DNS error from the upstream pattern host.
-	tr := NewTransport(
+func TestTransport_AllDownUpstreamFailsFast(t *testing.T) {
+	_, err := NewTransportE(
 		WithUpstreams(
 			Upstream("http://nopeer.local",
 				Server("http://10.0.0.1:1", Down()),
 			),
 		),
 	)
+	if err == nil || !strings.Contains(err.Error(), "all servers are down") {
+		t.Fatalf("got %v, want an all-down construction error", err)
+	}
+}
 
-	req := httptest.NewRequest(http.MethodGet, "http://nopeer.local/test", nil)
-	_, err := tr.RoundTrip(req)
-	if err != ErrNoPeerAvailable {
-		t.Fatalf("got %v, want ErrNoPeerAvailable", err)
+func TestTransport_NoPeerAvailableWhenAllPeersQuarantined(t *testing.T) {
+	backendErr := errors.New("backend failed")
+	attempts := 0
+	transport := NewTransport(
+		WithRoundTripper(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			attempts++
+			return nil, backendErr
+		})),
+		WithUpstreams(
+			Upstream("http://quarantined.local",
+				Server("http://10.0.0.1:8080", MaxFails(1), FailTimeout(time.Minute)),
+				Server("http://10.0.0.2:8080", MaxFails(1), FailTimeout(time.Minute)),
+			),
+		),
+	)
+
+	// The first request reaches both peers and quarantines each one.
+	req := httptest.NewRequest(http.MethodGet, "http://quarantined.local/test", nil)
+	if _, err := transport.RoundTrip(req); !errors.Is(err, backendErr) {
+		t.Fatalf("first RoundTrip error = %v, want %v", err, backendErr)
+	}
+	if attempts != 2 {
+		t.Fatalf("first RoundTrip attempts = %d, want 2", attempts)
+	}
+
+	// A fresh picker cannot select either peer during fail_timeout.
+	req = httptest.NewRequest(http.MethodGet, "http://quarantined.local/test", nil)
+	if _, err := transport.RoundTrip(req); err != ErrNoPeerAvailable {
+		t.Fatalf("second RoundTrip error = %v, want ErrNoPeerAvailable", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("underlying RoundTripper called for quarantined peers; attempts = %d, want 2", attempts)
 	}
 }
 

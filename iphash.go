@@ -63,6 +63,9 @@ type ipHashPicker struct {
 // Corresponds to nginx's ngx_http_upstream_get_ip_hash_peer() (lines 149-226).
 func (p *ipHashPicker) Pick() *Peer {
 	group := p.PrimaryGroup()
+	if p.backupPhase && p.BackupGroup() != nil {
+		group = p.BackupGroup()
+	}
 
 	if len(group.Peers) < 2 {
 		return p.RRPicker.Pick()
@@ -84,9 +87,6 @@ func (p *ipHashPicker) Pick() *Peer {
 	}
 	addrLen := 3
 	if len(addr) > 4 {
-		addrLen = len(addr)
-	}
-	if addrLen > len(addr) {
 		addrLen = len(addr)
 	}
 

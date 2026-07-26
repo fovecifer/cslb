@@ -387,8 +387,7 @@ func Example_mixedScheme() {
 // If a backend times out, the request is automatically retried on the next one.
 func Example_timeout() {
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(2 * time.Second)
-		fmt.Fprint(w, "slow")
+		<-r.Context().Done()
 	}))
 	defer slow.Close()
 
@@ -398,7 +397,7 @@ func Example_timeout() {
 	defer fast.Close()
 
 	transport := cslb.NewTransport(
-		cslb.WithTimeout(500*time.Millisecond), // max 500ms per attempt
+		cslb.WithTimeout(50*time.Millisecond), // max 50ms per attempt
 		cslb.WithUpstreams(
 			cslb.Upstream("http://timeout.local",
 				cslb.Server(slow.URL), // will time out

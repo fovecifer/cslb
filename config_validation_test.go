@@ -170,6 +170,16 @@ func TestNewTransportE_RejectsInvalidTransportSettings(t *testing.T) {
 			option:  WithMaxBodyBuffer(-1),
 			wantErr: "max body buffer must be non-negative",
 		},
+		{
+			name:    "nil underlying transport",
+			option:  WithRoundTripper(nil),
+			wantErr: ErrNilRoundTripper.Error(),
+		},
+		{
+			name:    "nil next upstream condition",
+			option:  WithNextUpstream(nil),
+			wantErr: "next upstream condition must not be nil",
+		},
 	}
 
 	for _, test := range tests {
@@ -183,6 +193,44 @@ func TestNewTransportE_RejectsInvalidTransportSettings(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewTransportE_RejectsAllDownUpstream(t *testing.T) {
+	_, err := NewTransportE(
+		WithUpstreams(
+			Upstream("http://service.local",
+				Server("http://127.0.0.1:8080", Down()),
+				Server("http://127.0.0.2:8080", Down(), Backup()),
+			),
+		),
+	)
+	if err == nil {
+		t.Fatal("expected construction error")
+	}
+	if !strings.Contains(err.Error(), "all servers are down") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNewTransportE_AcceptsBackupOnlyUpstream(t *testing.T) {
+	transport, err := NewTransportE(
+		WithUpstreams(
+			Upstream("http://service.local",
+				Server("http://127.0.0.1:8080", Backup()),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("backup-only upstream should be valid: %v", err)
+	}
+
+	ups := transport.upstreams[upstreamKey{scheme: "http", host: "service.local"}]
+	picker := ups.balancer.NewPicker()
+	peer := picker.Pick()
+	if peer == nil || !peer.Backup {
+		t.Fatalf("Pick = %v, want the backup peer", peer)
+	}
+	picker.Done(peer, false)
 }
 
 func TestNewTransportE_AcceptsZeroValuedLimits(t *testing.T) {

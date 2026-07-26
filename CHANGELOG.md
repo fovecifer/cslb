@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `ErrNilResponseBody`, returned when the underlying `http.RoundTripper` produces
+  a response with a nil `Body` in violation of its contract.
+- Test suites for fuzz/property invariants, concurrent peer-state transitions,
+  resource cleanup under repeated failures, real TCP/TLS/HTTP/2/proxy faults,
+  external-package API contracts, frozen nginx mappings, and performance
+  benchmarks.
+- Scheduled mutation testing with a 100% test-efficacy gate. CI now enforces
+  zero uncovered statements, runs tests in randomized order, smoke-tests fuzz
+  targets and benchmarks, and covers Go 1.21 plus current Linux, macOS, and
+  Windows environments.
+
+### Changed
+
+- Genuinely streaming request bodies are no longer eagerly buffered when the
+  upstream has only one usable server, or when the default non-idempotent gate
+  makes a sent `POST`, `LOCK`, or `PATCH` terminal. Pre-send connection failures
+  through a standard `*http.Transport` can still fail over without losing the
+  unread stream.
+- `WithMaxBodyBuffer(0)` now explicitly means that every non-empty buffered body
+  spills to a temporary file instead of silently restoring the 32 MB default.
+- IP-Hash now hashes over the backup group after Round-Robin enters the backup
+  phase, matching nginx instead of continuing to inspect the primary group.
+- `RRPicker.Done` now uses the peer's `Backup` flag to resolve its owning group
+  directly instead of linearly scanning all primary peers on every attempt.
+
+### Removed
+
+- The unused exported `PeerGroup.Tries` field, before the v3 API is finalized.
+
+### Fixed
+
+- `WithRoundTripper(nil)` and `WithNextUpstream(nil)` now fail during
+  construction instead of being silently replaced by their defaults.
+- Upstreams whose servers are all marked `Down()` now fail during construction
+  instead of returning `ErrNoPeerAvailable` for every request. Backup-only
+  upstreams remain supported.
+- Consistent-hash ring deduplication now guards an empty point slice directly,
+  preventing a latent slice-bounds panic if its construction invariants change.
+- A response carrying a nil `Body` no longer panics the library. `http.RoundTripper`
+  requires a non-nil `Body`, but a custom or test implementation may still return
+  one; such a response is now rejected with `ErrNilResponseBody` at the single point
+  every response passes through, so the retry path, the per-attempt `cancelCloser`,
+  and the caller can all close it unconditionally. The response is rejected rather
+  than normalized to `http.NoBody` so that a broken RoundTripper cannot read as a
+  legitimate empty response.
+- A contract violation by the configured `http.RoundTripper` — `ErrNilResponseBody`,
+  `ErrInvalidRoundTrip`, or `ErrNilRoundTripper` — no longer affects upstream health.
+  Previously each such error degraded the peer's failure counter and effective
+  weight, so a client-side defect could mark an entirely healthy pool unhealthy.
+  The peer is now released neutrally, which is distinct from reporting success:
+  success would run nginx's recovery path and clear the failure counter of a peer
+  that is still recovering. Retry behaviour is unchanged — whether to try the next
+  peer remains the retry condition's decision, so a custom `WithNextUpstream` is
+  still consulted.
+- A neutral release no longer costs a peer its recovery probe. Selecting a peer
+  whose `fail_timeout` has elapsed advances its `checked` timestamp, which makes
+  every other request skip it until the attempt reports back. When that attempt
+  turned out to say nothing about the upstream — a caller cancellation, a local
+  replay error, or now a RoundTripper contract violation — the timestamp stayed
+  advanced and re-quarantined the peer for another full `fail_timeout`. The
+  pre-selection timestamp is now restored, so the probe passes to the next
+  request. This also fixes the pre-existing caller-cancellation path, where a
+  client that cancels frequently could delay a peer's recovery indefinitely.
+  The rollback is conditional: if a concurrent request recorded a real failure
+  on the same peer in the meantime, that newer timestamp is authoritative and is
+  left in place, so a neutral release can never erase an active quarantine. The
+  check uses a per-peer version counter rather than comparing timestamps, since
+  two writes on a coarse-grained clock can produce the same instant.
+
 ## [v3.0.0-rc.1] - 2026-07-11
 
 ### Added

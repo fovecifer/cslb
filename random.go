@@ -20,6 +20,7 @@ type Random struct {
 	rr     *RoundRobin
 	two    bool // "random two" mode (Power of Two Choices)
 	ranges []weightRange
+	intn   func(int) int
 }
 
 // weightRange maps cumulative weight to peer index.
@@ -44,8 +45,9 @@ func NewRandomTwo(peers []*Peer) *Random {
 func newRandom(peers []*Peer, two bool) *Random {
 	rr := NewRoundRobin(peers)
 	r := &Random{
-		rr:  rr,
-		two: two,
+		rr:   rr,
+		two:  two,
+		intn: rand.Intn,
 	}
 
 	// Build weight ranges for weighted random selection.
@@ -172,7 +174,7 @@ func (p *randomPicker) randomSelect(group *PeerGroup) *Peer {
 		return nil
 	}
 
-	x := rand.Intn(group.TotalWeight)
+	x := p.balancer.intn(group.TotalWeight)
 
 	// Binary search (nginx uses this in ngx_http_upstream_get_random_peer)
 	lo, hi := 0, len(p.balancer.ranges)-1

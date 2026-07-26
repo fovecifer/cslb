@@ -62,6 +62,109 @@ func TestTransport_GetBodyClosesOriginalBody(t *testing.T) {
 	}
 }
 
+func TestTransport_StreamingBodyBufferingDependsOnReplayPossibility(t *testing.T) {
+	const payload = "streaming payload"
+
+	tests := []struct {
+		name             string
+		method           string
+		servers          []ServerConfig
+		enablePostReplay bool
+		wantEagerRead    bool
+	}{
+		{
+			name:    "single usable peer",
+			method:  http.MethodPut,
+			servers: []ServerConfig{Server("http://127.0.0.1:8080")},
+		},
+		{
+			name:   "non-idempotent replay disabled",
+			method: http.MethodPost,
+			servers: []ServerConfig{
+				Server("http://127.0.0.1:8080"),
+				Server("http://127.0.0.2:8080"),
+			},
+		},
+		{
+			name:   "multiple peers with idempotent method",
+			method: http.MethodPut,
+			servers: []ServerConfig{
+				Server("http://127.0.0.1:8080"),
+				Server("http://127.0.0.2:8080"),
+			},
+			wantEagerRead: true,
+		},
+		{
+			name:   "non-idempotent replay enabled",
+			method: http.MethodPost,
+			servers: []ServerConfig{
+				Server("http://127.0.0.1:8080"),
+				Server("http://127.0.0.2:8080"),
+			},
+			enablePostReplay: true,
+			wantEagerRead:    true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			original := newTrackingBody(payload)
+			readBeforeAttempt := -1
+			closedBeforeAttempt := false
+
+			options := []TransportOption{
+				WithRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					readBeforeAttempt = len(payload) - original.r.Len()
+					closedBeforeAttempt = original.closed
+					got, err := io.ReadAll(req.Body)
+					if err != nil {
+						return nil, err
+					}
+					if string(got) != payload {
+						return nil, errors.New("attempt received the wrong request body")
+					}
+					if err := req.Body.Close(); err != nil {
+						return nil, err
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       http.NoBody,
+						Request:    req,
+					}, nil
+				})),
+				WithUpstreams(Upstream("http://stream.local", test.servers...)),
+			}
+			if test.enablePostReplay {
+				options = append(options, WithNonIdempotentRetries())
+			}
+			transport := NewTransport(options...)
+
+			req, err := http.NewRequest(test.method, "http://stream.local/upload", original)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("RoundTrip: %v", err)
+			}
+			resp.Body.Close()
+
+			if test.wantEagerRead {
+				if readBeforeAttempt != len(payload) || !closedBeforeAttempt {
+					t.Fatalf("body state before attempt = read %d, closed %v; want fully buffered",
+						readBeforeAttempt, closedBeforeAttempt)
+				}
+			} else if readBeforeAttempt != 0 || closedBeforeAttempt {
+				t.Fatalf("body state before attempt = read %d, closed %v; want untouched streaming body",
+					readBeforeAttempt, closedBeforeAttempt)
+			}
+			if !original.closed {
+				t.Fatal("original request body was not closed after RoundTrip")
+			}
+		})
+	}
+}
+
 func TestTransport_EarlyErrorsCloseRequestBody(t *testing.T) {
 	initErr := errors.New("initialization failed")
 
@@ -147,7 +250,7 @@ func TestPrepareBody_BuffersInMemoryAndReplays(t *testing.T) {
 	req := &http.Request{Body: original, ContentLength: -1}
 	transport := NewTransport(WithMaxBodyBuffer(64))
 
-	getBody, cleanup, err := transport.prepareBody(req)
+	getBody, cleanup, err := transport.prepareBody(req, true)
 	if err != nil {
 		t.Fatalf("prepare body: %v", err)
 	}
@@ -167,13 +270,13 @@ func TestPrepareBody_BuffersInMemoryAndReplays(t *testing.T) {
 
 func TestPrepareBody_SpillsToFileAndCleansUp(t *testing.T) {
 	tempDir := t.TempDir()
-	t.Setenv("TMPDIR", tempDir)
+	setProcessTempDir(t, tempDir)
 
 	original := newTrackingBody("payload larger than limit")
 	req := &http.Request{Body: original, ContentLength: -1}
 	transport := NewTransport(WithMaxBodyBuffer(4))
 
-	getBody, cleanup, err := transport.prepareBody(req)
+	getBody, cleanup, err := transport.prepareBody(req, true)
 	if err != nil {
 		t.Fatalf("prepare body: %v", err)
 	}
@@ -216,12 +319,39 @@ func TestPrepareBody_SpillsToFileAndCleansUp(t *testing.T) {
 	}
 }
 
+func TestPrepareBody_ZeroMemoryLimitAlwaysSpills(t *testing.T) {
+	tempDir := t.TempDir()
+	setProcessTempDir(t, tempDir)
+
+	original := newTrackingBody("payload")
+	req := &http.Request{Body: original, ContentLength: -1}
+	transport := NewTransport(WithMaxBodyBuffer(0))
+
+	getBody, cleanup, err := transport.prepareBody(req, true)
+	if err != nil {
+		t.Fatalf("prepare body: %v", err)
+	}
+	if cleanup == nil {
+		t.Fatal("zero memory limit did not spill a non-empty body")
+	}
+	t.Cleanup(cleanup)
+
+	entries, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatalf("read temp directory: %v", err)
+	}
+	if len(entries) != 1 || !strings.HasPrefix(entries[0].Name(), "cslb-body-") {
+		t.Fatalf("temporary files = %v, want one cslb-body-* file", entries)
+	}
+	assertBodyReplay(t, getBody, "payload")
+}
+
 func TestPrepareBody_ReadErrorClosesOriginalBody(t *testing.T) {
 	wantErr := errors.New("read failed")
 	original := &failingBody{err: wantErr}
 	req := &http.Request{Body: original}
 
-	_, _, err := NewTransport().prepareBody(req)
+	_, _, err := NewTransport().prepareBody(req, true)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("prepare body error = %v, want %v", err, wantErr)
 	}

@@ -24,6 +24,7 @@ var (
 	ErrNilRequestURL         = errors.New("cslb: nil request URL")
 	ErrNilRoundTripper       = errors.New("cslb: nil underlying transport")
 	ErrInvalidRoundTrip      = errors.New("cslb: underlying transport returned nil response and nil error")
+	ErrNilResponseBody       = errors.New("cslb: underlying transport returned a response with a nil body")
 	ErrInvalidUpstreamConfig = errors.New("cslb: invalid upstream configuration")
 )
 
@@ -61,12 +62,13 @@ type upstreamKey struct {
 
 // upstream holds the balancer and peer-to-address mapping for one upstream group.
 type upstream struct {
-	balancer  Balancer
-	backends  map[*Peer]*backendAddr
-	hashFunc  func(*http.Request) string
-	algo      AlgorithmType
-	sslName   string            // SNI override for TLS connections (proxy_ssl_name)
-	transport http.RoundTripper // per-upstream transport with custom TLS ServerName
+	balancer            Balancer
+	backends            map[*Peer]*backendAddr
+	hashFunc            func(*http.Request) string
+	algo                AlgorithmType
+	multipleUsablePeers bool
+	sslName             string            // SNI override for TLS connections (proxy_ssl_name)
+	transport           http.RoundTripper // per-upstream transport with custom TLS ServerName
 }
 
 // backendAddr stores the rewritten scheme and host for a backend peer.
@@ -348,7 +350,13 @@ func (cfg *upstreamConfig) addError(err error) {
 // WithRoundTripper sets the underlying http.RoundTripper used to send requests
 // to backend servers. Defaults to a standard http.Transport if not set.
 func WithRoundTripper(rt http.RoundTripper) TransportOption {
-	return func(t *Transport) { t.transport = rt }
+	return func(t *Transport) {
+		if rt == nil {
+			t.addInitError(ErrNilRoundTripper)
+			return
+		}
+		t.transport = rt
+	}
 }
 
 // WithTimeout sets the per-attempt request timeout. Each backend attempt gets
@@ -376,7 +384,8 @@ func WithConnectTimeout(d time.Duration) TransportOption {
 }
 
 // WithMaxBodyBuffer sets the maximum request body size to buffer in memory.
-// Bodies larger than this are spilled to a temporary file. Default is 32MB.
+// Bodies larger than this are spilled to a temporary file. Zero always spills
+// non-empty bodies; the default is 32MB.
 // This is not a total body-size limit; callers should enforce a separate limit
 // for untrusted or very large request bodies.
 func WithMaxBodyBuffer(size int64) TransportOption {
@@ -407,7 +416,13 @@ func WithMaxBodyBuffer(size int64) TransportOption {
 //	    return false
 //	})
 func WithNextUpstream(cond NextUpstreamCondition) TransportOption {
-	return func(t *Transport) { t.nextUpstream = cond }
+	return func(t *Transport) {
+		if cond == nil {
+			t.addInitError(errors.New("cslb: next upstream condition must not be nil"))
+			return
+		}
+		t.nextUpstream = cond
+	}
 }
 
 // WithNextUpstreamCodes configures which HTTP status codes are considered
@@ -554,10 +569,6 @@ func (cfg *upstreamConfig) addPeer(peer *Peer, addr string) {
 		scheme = u.Scheme
 		host = u.Host
 	}
-	if host == "" {
-		cfg.addError(fmt.Errorf("cslb: invalid backend address: %q", addr))
-		return
-	}
 
 	cfg.peers = append(cfg.peers, peer)
 	cfg.addrs[peer] = &backendAddr{scheme: scheme, host: host}
@@ -644,6 +655,16 @@ func (t *Transport) registerUpstream(pattern string, cfg *upstreamConfig) {
 		t.addInitError(fmt.Errorf("cslb: upstream %q has no backends", pattern))
 		return
 	}
+	usablePeers := 0
+	for _, peer := range cfg.peers {
+		if !peer.Down {
+			usablePeers++
+		}
+	}
+	if usablePeers == 0 {
+		t.addInitError(fmt.Errorf("cslb: upstream %q has no usable backends: all servers are down", pattern))
+		return
+	}
 
 	key := upstreamKey{scheme: u.Scheme, host: u.Host}
 	if _, exists := t.upstreams[key]; exists {
@@ -652,11 +673,12 @@ func (t *Transport) registerUpstream(pattern string, cfg *upstreamConfig) {
 	}
 
 	t.upstreams[key] = &upstream{
-		balancer: newBalancer(cfg.algo, cfg.peers),
-		backends: cfg.addrs,
-		hashFunc: cfg.hashFunc,
-		algo:     cfg.algo,
-		sslName:  cfg.sslName,
+		balancer:            newBalancer(cfg.algo, cfg.peers),
+		backends:            cfg.addrs,
+		hashFunc:            cfg.hashFunc,
+		algo:                cfg.algo,
+		multipleUsablePeers: usablePeers > 1,
+		sslName:             cfg.sslName,
 	}
 }
 
@@ -695,6 +717,10 @@ func (c *cancelCloser) Close() error {
 type attemptDecision struct {
 	retry  bool
 	failed bool
+	// neutral releases the peer without any health signal. It is distinct from
+	// failed == false, which reports success and would run nginx's recovery
+	// path, clearing the failure counter of a still-recovering peer.
+	neutral bool
 }
 
 // RoundTrip implements http.RoundTripper. It matches the request against
@@ -738,8 +764,8 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return failRoundTrip(req, ErrInvalidUpstreamConfig)
 	}
 
-	// Prepare body for retries
-	getBody, cleanup, err := t.prepareBody(baseReq)
+	// Prepare the body for replay only when a later attempt may need it.
+	getBody, cleanup, err := t.prepareBody(baseReq, t.requestBodyMayNeedReplay(ups, baseReq))
 	if err != nil {
 		return nil, err
 	}
@@ -839,7 +865,8 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// canceled request out across the remaining peers or penalize them.
 		if err != nil && reqCtx.Err() != nil {
 			doneNeutral(pk, peer)
-			if resp != nil && resp.Body != nil {
+			// roundTrip guarantees a non-nil Body on any non-nil response.
+			if resp != nil {
 				resp.Body.Close()
 			}
 			return nil, reqCtx.Err()
@@ -851,7 +878,11 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			err,
 			requestWasSent(rt, requestSent, resp, err),
 		)
-		pk.Done(peer, decision.failed)
+		if decision.neutral {
+			doneNeutral(pk, peer)
+		} else {
+			pk.Done(peer, decision.failed)
+		}
 
 		if !decision.retry {
 			return resp, err
@@ -863,6 +894,16 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		lastResp = resp
 		lastErr = err
 	}
+}
+
+// isRoundTripperContractError reports whether err describes the configured
+// RoundTripper breaking its own contract, rather than an upstream server
+// misbehaving. These errors say nothing about peer health and are not
+// retryable: the next peer would go through the same RoundTripper.
+func isRoundTripperContractError(err error) bool {
+	return errors.Is(err, ErrNilResponseBody) ||
+		errors.Is(err, ErrInvalidRoundTrip) ||
+		errors.Is(err, ErrNilRoundTripper)
 }
 
 func failRoundTrip(req *http.Request, err error) (*http.Response, error) {
@@ -893,14 +934,22 @@ func (t *Transport) shouldRetry(resp *http.Response, err error) bool {
 }
 
 func (t *Transport) decideAttempt(req *http.Request, resp *http.Response, err error, sent bool) attemptDecision {
+	// A contract violation by the configured RoundTripper is a local defect. It
+	// says nothing about upstream health, so the peer is released neutrally:
+	// neither as a failure, nor as the success that would clear a recovering
+	// peer's counter. Whether to try the next peer is left to the retry
+	// condition below, so a custom WithNextUpstream is still honored.
+	neutral := isRoundTripperContractError(err)
+
 	if !t.shouldRetry(resp, err) {
-		return attemptDecision{}
+		return attemptDecision{neutral: neutral}
 	}
 
 	blockedNonIdempotent := sent && isNonIdempotentMethod(req.Method) && !t.retryNonIdempotent
 	decision := attemptDecision{
-		retry:  !blockedNonIdempotent,
-		failed: true,
+		retry:   !blockedNonIdempotent,
+		failed:  !neutral,
+		neutral: neutral,
 	}
 
 	if err == nil && resp != nil {
@@ -928,6 +977,17 @@ func isNonIdempotentMethod(method string) bool {
 	default:
 		return false
 	}
+}
+
+// requestBodyMayNeedReplay reports whether the request can reach another peer
+// after its body has started being sent. A custom next-upstream condition is
+// arbitrary and cannot be predicted before an attempt, so only the peer count
+// and the non-idempotent method gate are safe static exclusions.
+func (t *Transport) requestBodyMayNeedReplay(ups *upstream, req *http.Request) bool {
+	if ups == nil || !ups.multipleUsablePeers {
+		return false
+	}
+	return !isNonIdempotentMethod(req.Method) || t.retryNonIdempotent
 }
 
 func traceRequestSent(req *http.Request) (*http.Request, *atomic.Bool) {
@@ -968,6 +1028,17 @@ func (t *Transport) roundTrip(rt http.RoundTripper, req *http.Request) (*http.Re
 	if resp == nil && err == nil {
 		return failRoundTrip(req, ErrInvalidRoundTrip)
 	}
+	if resp != nil && resp.Body == nil {
+		// http.RoundTripper requires a non-nil Body, but a custom or test
+		// implementation may still return one. Reject it here, the single point
+		// every response passes through, so retry bookkeeping, the per-attempt
+		// cancelCloser, and the caller can all Close unconditionally.
+		//
+		// Substituting http.NoBody instead would let a broken RoundTripper read
+		// as a legitimate empty response, so the defect is surfaced rather than
+		// papered over.
+		return failRoundTrip(req, ErrNilResponseBody)
+	}
 	return resp, err
 }
 
@@ -995,9 +1066,9 @@ func (t *Transport) newPicker(ups *upstream, req *http.Request) Picker {
 	return ups.balancer.NewPicker()
 }
 
-// prepareBody buffers the request body so it can be replayed on retries.
+// prepareBody makes the request body available to each permitted attempt.
 // Returns a getBody function, an optional cleanup function, and any error.
-func (t *Transport) prepareBody(req *http.Request) (getBody func() (io.ReadCloser, error), cleanup func(), err error) {
+func (t *Transport) prepareBody(req *http.Request, replayPossible bool) (getBody func() (io.ReadCloser, error), cleanup func(), err error) {
 	if req.GetBody != nil {
 		if req.Body == nil {
 			return req.GetBody, nil, nil
@@ -1058,6 +1129,20 @@ func (t *Transport) prepareBody(req *http.Request) (getBody func() (io.ReadClose
 		}, func() { initialBody.Close() }, nil
 	}
 
+	if !replayPossible {
+		// Do not drain a genuinely streaming body before the only attempt that
+		// can consume it. Suppress the underlying RoundTripper's Close so the
+		// same unread stream remains available after a standard *http.Transport
+		// connection failure that happened before any request bytes were
+		// written. Such a failure is the only path that can reach another peer
+		// without replayPossible. A sent attempt is terminal either because
+		// there is no other usable peer or because of the non-idempotent gate;
+		// errors from custom RoundTrippers are conservatively treated as sent.
+		initialBody := req.Body
+		req.Body = io.NopCloser(initialBody)
+		return nil, func() { initialBody.Close() }, nil
+	}
+
 	// Buffer body: memory or spill to temp file
 	b, f, err := t.readBody(req.Body)
 	req.Body.Close()
@@ -1066,25 +1151,7 @@ func (t *Transport) prepareBody(req *http.Request) (getBody func() (io.ReadClose
 	}
 
 	if f != nil {
-		// Spilled to file
-		stat, err := f.Stat()
-		if err != nil {
-			f.Close()
-			os.Remove(f.Name())
-			return nil, nil, err
-		}
-		req.ContentLength = stat.Size()
-		return func() (io.ReadCloser, error) {
-				_, err := f.Seek(0, 0)
-				if err != nil {
-					return nil, err
-				}
-				return io.NopCloser(f), nil
-			}, func() {
-				name := f.Name()
-				f.Close()
-				os.Remove(name)
-			}, nil
+		return prepareSpilledBody(req, f)
 	}
 
 	// Fits in memory
@@ -1094,13 +1161,49 @@ func (t *Transport) prepareBody(req *http.Request) (getBody func() (io.ReadClose
 	}, nil, nil
 }
 
+// bodyTempFile is the subset of os.File used by body replay.
+type bodyTempFile interface {
+	io.ReadWriteSeeker
+	io.Closer
+	Stat() (os.FileInfo, error)
+	Name() string
+}
+
+type bodyTempFileFactory func() (bodyTempFile, error)
+
+func prepareSpilledBody(req *http.Request, f bodyTempFile) (getBody func() (io.ReadCloser, error), cleanup func(), err error) {
+	stat, err := f.Stat()
+	if err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return nil, nil, err
+	}
+	req.ContentLength = stat.Size()
+	return func() (io.ReadCloser, error) {
+			_, err := f.Seek(0, 0)
+			if err != nil {
+				return nil, err
+			}
+			return io.NopCloser(f), nil
+		}, func() {
+			name := f.Name()
+			f.Close()
+			os.Remove(name)
+		}, nil
+}
+
+func createBodyTempFile() (bodyTempFile, error) {
+	return os.CreateTemp("", "cslb-body-*")
+}
+
 // readBody reads a request body, buffering small bodies in memory and
 // spilling large ones to a temporary file.
-func (t *Transport) readBody(r io.Reader) ([]byte, *os.File, error) {
+func (t *Transport) readBody(r io.Reader) ([]byte, bodyTempFile, error) {
+	return t.readBodyWithFactory(r, createBodyTempFile)
+}
+
+func (t *Transport) readBodyWithFactory(r io.Reader, createFile bodyTempFileFactory) ([]byte, bodyTempFile, error) {
 	limit := t.maxBodyBuffer
-	if limit <= 0 {
-		limit = defaultMaxBodyBuffer
-	}
 
 	lr := io.LimitReader(r, limit+1)
 	b, err := io.ReadAll(lr)
@@ -1113,7 +1216,7 @@ func (t *Transport) readBody(r io.Reader) ([]byte, *os.File, error) {
 	}
 
 	// Spill to temp file
-	f, err := os.CreateTemp("", "cslb-body-*")
+	f, err := createFile()
 	if err != nil {
 		return nil, nil, err
 	}

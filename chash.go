@@ -143,10 +143,6 @@ func buildChashRing(peers []*Peer) []chashPoint {
 		}
 		totalPoints += p.Weight * consistentReplicas
 	}
-	if totalPoints == 0 {
-		return nil
-	}
-
 	pts := make([]chashPoint, 0, totalPoints)
 	for _, p := range peers {
 		if p == nil || p.Weight <= 0 {
@@ -175,6 +171,9 @@ func buildChashRing(peers []*Peer) []chashPoint {
 
 	// Deduplicate adjacent identical hashes, keeping the first occurrence —
 	// nginx does the same so the ring layout is reproducible.
+	if len(pts) == 0 {
+		return nil
+	}
 	out := pts[:1]
 	for i := 1; i < len(pts); i++ {
 		if pts[i].hash != out[len(out)-1].hash {

@@ -61,6 +61,18 @@ type Peer struct {
 	fails           int
 	accessed        time.Time
 	checked         time.Time
+	// checkedSeq increments on every write to checked. A neutral release uses
+	// it to tell whether checked still holds the value it wrote; the timestamp
+	// itself cannot serve that purpose, because two writes on a coarse-grained
+	// clock can produce the same instant.
+	checkedSeq uint64
+}
+
+// setChecked updates the peer's checked timestamp and its version counter.
+// The caller must hold the owning PeerGroup lock.
+func (p *Peer) setChecked(t time.Time) {
+	p.checked = t
+	p.checkedSeq++
 }
 
 func (p *Peer) init() {
@@ -84,7 +96,6 @@ type PeerGroup struct {
 	mu          sync.Mutex
 	Peers       []*Peer
 	TotalWeight int
-	Tries       int  // number of non-down peers
 	single      bool // nginx single-peer fast path; false whenever backups exist
 }
 
@@ -101,15 +112,9 @@ func BuildGroups(peers []*Peer) (primary *PeerGroup, backup *PeerGroup) {
 		if p.Backup {
 			backup.Peers = append(backup.Peers, p)
 			backup.TotalWeight += p.Weight
-			if !p.Down {
-				backup.Tries++
-			}
 		} else {
 			primary.Peers = append(primary.Peers, p)
 			primary.TotalWeight += p.Weight
-			if !p.Down {
-				primary.Tries++
-			}
 		}
 	}
 

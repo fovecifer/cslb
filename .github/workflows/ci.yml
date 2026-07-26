@@ -13,16 +13,22 @@ concurrency:
 
 jobs:
   test:
-    name: Go ${{ matrix.go-version }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} / Go ${{ matrix.go-version }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
 
     strategy:
       fail-fast: false
       matrix:
-        go-version:
-          - '1.21.x'
-          - stable
+        include:
+          - os: ubuntu-latest
+            go-version: '1.21.x'
+          - os: ubuntu-latest
+            go-version: stable
+          - os: macos-latest
+            go-version: stable
+          - os: windows-latest
+            go-version: stable
 
     steps:
       - name: Check out repository
@@ -34,33 +40,51 @@ jobs:
           go-version: ${{ matrix.go-version }}
 
       - name: Run tests
-        run: go test ./...
+        run: go test -shuffle=on ./...
 
       - name: Run static analysis
         run: go vet ./...
 
       - name: Run race detector
-        if: ${{ matrix.go-version == 'stable' }}
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.go-version == 'stable' }}
         run: go test -race ./...
 
-      - name: Measure coverage
-        if: ${{ matrix.go-version == 'stable' }}
-        run: go test -covermode=atomic -coverprofile=coverage.out ./...
+      - name: Stress randomized test order
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.go-version == 'stable' }}
+        run: go test -shuffle=on -count=5 ./...
 
-      - name: Enforce coverage threshold
-        if: ${{ matrix.go-version == 'stable' }}
+      - name: Run fuzz smoke tests
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.go-version == 'stable' }}
         shell: bash
         run: |
-          minimum='85.0'
+          for target in \
+            FuzzNewTransportEConfiguration \
+            FuzzTransportBodyReplay \
+            FuzzBalancerStateMachine \
+            FuzzClientIP; do
+            go test -run='^$' -fuzz="^${target}$" -fuzztime=2s .
+          done
+
+      - name: Run benchmark smoke tests
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.go-version == 'stable' }}
+        run: go test -run='^$' -bench=. -benchtime=1x ./...
+
+      - name: Measure coverage
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.go-version == 'stable' }}
+        run: go test -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Enforce exact coverage
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.go-version == 'stable' }}
+        shell: bash
+        run: |
           total="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $3); print $3}')"
           if [[ -z "${total}" ]]; then
             echo 'Unable to determine total coverage.' >&2
             exit 1
           fi
-          echo "Total coverage: ${total}% (minimum: ${minimum}%)"
-          awk -v total="${total}" -v minimum="${minimum}" 'BEGIN {
-            if (total + 0 < minimum + 0) {
-              printf "Coverage %.1f%% is below %.1f%%.\n", total, minimum > "/dev/stderr"
-              exit 1
-            }
-          }'
+          missed="$(awk 'NR > 1 && $3 == 0 { missed += $2 } END { print missed + 0 }' coverage.out)"
+          echo "Total coverage: ${total}% (${missed} uncovered statements)"
+          if [[ "${missed}" -ne 0 ]]; then
+            awk 'NR > 1 && $3 == 0 { print }' coverage.out >&2
+            exit 1
+          fi

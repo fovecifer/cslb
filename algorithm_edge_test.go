@@ -197,6 +197,38 @@ func TestIPHash_IPv4Uses24BitSubnet(t *testing.T) {
 	}
 }
 
+func TestIPHash_BackupPhaseHashesOverBackupGroup(t *testing.T) {
+	primary := &Peer{Addr: "primary", Weight: 1}
+	backupA := &Peer{Addr: "backup-a", Weight: 1, Backup: true}
+	backupB := &Peer{Addr: "backup-b", Weight: 1, Backup: true}
+	backupC := &Peer{Addr: "backup-c", Weight: 1, Backup: true}
+	balancer := NewIPHash([]*Peer{primary, backupA, backupB, backupC})
+	picker := balancer.NewPickerForIP(net.IPv4(10, 0, 2, 1))
+
+	if got := picker.Pick(); got != primary {
+		t.Fatalf("primary Pick = %v, want %v", got, primary)
+	} else {
+		picker.Done(got, true)
+	}
+
+	// A one-peer primary group falls back to Round-Robin, which enters the
+	// backup phase and selects the first smooth-WRR backup.
+	if got := picker.Pick(); got != backupA {
+		t.Fatalf("first backup Pick = %v, want %v", got, backupA)
+	} else {
+		picker.Done(got, true)
+	}
+
+	// nginx leaves its current peer-group pointer on the backup list. For this
+	// client IP the next hash maps directly to backup C; continuing smooth-WRR
+	// over the backups would select backup B instead.
+	if got := picker.Pick(); got != backupC {
+		t.Fatalf("hashed backup Pick = %v, want %v", got, backupC)
+	} else {
+		picker.Done(got, false)
+	}
+}
+
 func TestAlgorithms_ConcurrentPickAndDone(t *testing.T) {
 	for name, newPickerFactory := range algorithmPickerFactories() {
 		t.Run(name, func(t *testing.T) {
@@ -276,5 +308,80 @@ func TestAlgorithms_ResetFailuresAfterSuccessfulProbe(t *testing.T) {
 				t.Fatalf("fails after successful probe = %d, want 0", target.fails)
 			}
 		})
+	}
+}
+
+// A neutral release rolls back the checked timestamp that selection advanced,
+// handing the recovery probe to the next request. That rollback must not undo a
+// real failure a concurrent request recorded in the meantime, which would erase
+// the peer's quarantine entirely.
+func TestRRPicker_NeutralReleaseKeepsConcurrentFailureTimestamp(t *testing.T) {
+	target := &Peer{Addr: "10.0.0.1:8080", Weight: 1, MaxFails: 1, FailTimeout: 10 * time.Second}
+	// A second, permanently down peer keeps the group off the single-peer fast
+	// path, which ignores failure counters entirely.
+	rr := NewRoundRobin([]*Peer{target, {Addr: "10.0.0.2:8080", Weight: 1, Down: true}})
+
+	// Healthy but idle long enough that selection advances checked.
+	target.accessed = time.Now().Add(-time.Hour)
+	target.checked = time.Now().Add(-time.Hour)
+
+	inFlight := rr.NewPicker().(*RRPicker)
+	if got := inFlight.Pick(); got != target {
+		t.Fatalf("in-flight picker selected %v, want the target peer", got)
+	}
+
+	// A concurrent request selects the same peer and genuinely fails.
+	concurrent := rr.NewPicker().(*RRPicker)
+	if got := concurrent.Pick(); got != target {
+		t.Fatalf("concurrent picker selected %v, want the target peer", got)
+	}
+	concurrent.Done(target, true)
+	failedAt := target.checked
+
+	// The first request is then cancelled, releasing its peer neutrally.
+	inFlight.doneNeutral(target)
+
+	if !target.checked.Equal(failedAt) {
+		t.Fatalf("neutral rollback overwrote the concurrent failure timestamp (checked moved back %v)",
+			failedAt.Sub(target.checked))
+	}
+	if got := rr.NewPicker().Pick(); got != nil {
+		t.Fatalf("peer selectable despite fails=%d; the quarantine was erased", target.fails)
+	}
+}
+
+// The concurrency guard must not rely on the checked timestamp as a version
+// tag: on a coarse-grained clock two writes can land on the same instant, and a
+// value comparison would then mistake a concurrent failure for its own write
+// and roll it back. This emulates that collision exactly.
+func TestRRPicker_NeutralReleaseGuardSurvivesTimestampCollision(t *testing.T) {
+	target := &Peer{Addr: "10.0.0.1:8080", Weight: 1, MaxFails: 1, FailTimeout: 10 * time.Second}
+	rr := NewRoundRobin([]*Peer{target, {Addr: "10.0.0.2:8080", Weight: 1, Down: true}})
+
+	target.accessed = time.Now().Add(-time.Hour)
+	target.checked = time.Now().Add(-time.Hour)
+
+	inFlight := rr.NewPicker().(*RRPicker)
+	if got := inFlight.Pick(); got != target {
+		t.Fatalf("in-flight picker selected %v, want the target peer", got)
+	}
+	probeWrote := target.checked
+
+	// A concurrent request fails on the same peer, and its clock reading
+	// happens to be identical to the one selection just wrote.
+	concurrent := rr.NewPicker().(*RRPicker)
+	if got := concurrent.Pick(); got != target {
+		t.Fatalf("concurrent picker selected %v, want the target peer", got)
+	}
+	concurrent.Done(target, true)
+	target.checked = probeWrote // same instant as the probe's write
+
+	inFlight.doneNeutral(target)
+
+	if !target.checked.Equal(probeWrote) {
+		t.Fatal("neutral rollback discarded a concurrent failure it could not distinguish by timestamp")
+	}
+	if got := rr.NewPicker().Pick(); got != nil {
+		t.Fatalf("peer selectable despite fails=%d; the quarantine was erased", target.fails)
 	}
 }

@@ -1,0 +1,43 @@
+name: Mutation Testing
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  gremlins:
+    name: Gremlins quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up stable Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Install Gremlins
+        run: go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0
+
+      - name: Run mutation testing
+        run: |
+          gremlins unleash \
+            --workers=4 \
+            --threshold-mcover=98 \
+            --threshold-efficacy=100 \
+            --output=mutation-results.json \
+            .
+
+      - name: Upload mutation report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-results
+          path: mutation-results.json
