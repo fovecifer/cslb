@@ -67,7 +67,8 @@ func (p *ipHashPicker) Pick() *Peer {
 		group = p.BackupGroup()
 	}
 
-	if len(group.Peers) < 2 {
+	modulus, ok := hashModulus(group)
+	if len(group.Peers) < 2 || !ok {
 		return p.RRPicker.Pick()
 	}
 
@@ -99,7 +100,7 @@ func (p *ipHashPicker) Pick() *Peer {
 		for i := 0; i < addrLen; i++ {
 			hash = (hash*113 + uint32(addr[i])) % 6271
 		}
-		w := int(hash % uint32(group.TotalWeight))
+		w := int(hash % modulus)
 
 		var selected *Peer
 		for _, peer := range group.Peers {

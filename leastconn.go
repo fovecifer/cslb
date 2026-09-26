@@ -76,11 +76,14 @@ func (p *leastConnPicker) pickFromGroup(group *PeerGroup) *Peer {
 		// This is the normalized comparison: conns/weight < best_conns/best_weight
 		// without floating point.
 
-		if best == nil ||
-			peer.conns*best.Weight < best.conns*peer.Weight {
+		cmp := -1
+		if best != nil {
+			cmp = compareLoad(peer, best)
+		}
+		if cmp < 0 {
 			best = peer
 			many = false
-		} else if peer.conns*best.Weight == best.conns*peer.Weight {
+		} else if cmp == 0 {
 			many = true
 		}
 	}
@@ -97,7 +100,7 @@ func (p *leastConnPicker) pickFromGroup(group *PeerGroup) *Peer {
 			if p.Tried(peer) || peer.Down {
 				return false
 			}
-			if peer.conns*least.Weight != least.conns*peer.Weight {
+			if compareLoad(peer, least) != 0 {
 				return false
 			}
 			if peer.MaxFails > 0 &&

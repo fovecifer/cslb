@@ -60,6 +60,22 @@ type upstreamKey struct {
 	host   string
 }
 
+// newUpstreamKey builds the lookup key for an origin. Scheme and host compare
+// case-insensitively and an explicit default port is dropped, so
+// http://API.example.com:80 matches the upstream http://api.example.com
+// instead of silently bypassing it.
+func newUpstreamKey(scheme, host string) upstreamKey {
+	scheme = strings.ToLower(scheme)
+	host = strings.ToLower(host)
+	switch scheme {
+	case "http":
+		host = strings.TrimSuffix(host, ":80")
+	case "https":
+		host = strings.TrimSuffix(host, ":443")
+	}
+	return upstreamKey{scheme: scheme, host: host}
+}
+
 // upstream holds the balancer and peer-to-address mapping for one upstream group.
 type upstream struct {
 	balancer            Balancer
@@ -192,7 +208,8 @@ func (u UpstreamConfig) IPHash() UpstreamConfig {
 	return u
 }
 
-// Hash selects key-based hash for the upstream.
+// Hash selects key-based hash for the upstream. keyFunc runs before the
+// request body is prepared for sending, so it must not read req.Body.
 func (u UpstreamConfig) Hash(keyFunc func(*http.Request) string) UpstreamConfig {
 	u.Algorithm = AlgoHash
 	u.HashFunc = keyFunc
@@ -202,7 +219,7 @@ func (u UpstreamConfig) Hash(keyFunc func(*http.Request) string) UpstreamConfig 
 // HashConsistent selects ketama-style consistent hashing for the upstream.
 // Mirrors nginx's "hash <key> consistent". Compared to plain Hash, scaling
 // or restarting the upstream pool only redistributes ~1/N of keys instead
-// of nearly all of them.
+// of nearly all of them. As with Hash, keyFunc must not read req.Body.
 func (u UpstreamConfig) HashConsistent(keyFunc func(*http.Request) string) UpstreamConfig {
 	u.Algorithm = AlgoHashConsistent
 	u.HashFunc = keyFunc
@@ -313,6 +330,25 @@ func NewTransportE(opts ...TransportOption) (*Transport, error) {
 	}
 
 	return t, t.initErr
+}
+
+// CloseIdleConnections closes idle connections held by the underlying
+// RoundTripper and by the per-upstream transports created for ProxySSLName.
+// Connections currently in use are not interrupted. http.Client forwards its
+// own CloseIdleConnections here.
+func (t *Transport) CloseIdleConnections() {
+	if t == nil {
+		return
+	}
+	type closeIdler interface{ CloseIdleConnections() }
+	if c, ok := t.transport.(closeIdler); ok {
+		c.CloseIdleConnections()
+	}
+	for _, ups := range t.upstreams {
+		if c, ok := ups.transport.(closeIdler); ok {
+			c.CloseIdleConnections()
+		}
+	}
 }
 
 // Err returns the configuration error captured during construction, if any.
@@ -483,7 +519,8 @@ func WithUpstreams(upstreams ...UpstreamConfig) TransportOption {
 
 // ---------- Server options ----------
 
-// Weight sets the server's weight. Higher weight means more traffic.
+// Weight sets the server's weight. Higher weight means more traffic. It must
+// be between 1 and 65536; see the README for per-upstream totals.
 func Weight(w int) ServerOption {
 	return func(p *Peer) {
 		p.Weight = w
@@ -539,6 +576,9 @@ func (server ServerConfig) validate() error {
 	if server.Weight < 0 || (server.explicit.has(serverFieldWeight) && server.Weight == 0) {
 		err = errors.Join(err, errors.New("weight must be greater than zero"))
 	}
+	if server.Weight > maxServerWeight {
+		err = errors.Join(err, fmt.Errorf("weight must not exceed %d", maxServerWeight))
+	}
 	if server.MaxConns < 0 {
 		err = errors.Join(err, errors.New("max_conns must be non-negative"))
 	}
@@ -558,20 +598,54 @@ func (cfg *upstreamConfig) addPeer(peer *Peer, addr string) {
 	}
 
 	scheme := cfg.defaultScheme
-	host := addr
-
-	if strings.Contains(addr, "://") {
-		u, err := url.Parse(addr)
-		if err != nil || u.Scheme == "" || u.Host == "" {
-			cfg.addError(fmt.Errorf("cslb: invalid backend address: %q", addr))
-			return
-		}
+	raw := addr
+	hasScheme := strings.Contains(addr, "://")
+	if !hasScheme {
+		// A bare host[:port] inherits the upstream scheme.
+		raw = "//" + addr
+	}
+	u, err := parseOrigin(raw)
+	if err != nil {
+		cfg.addError(fmt.Errorf("cslb: invalid backend address: %q: %w", addr, err))
+		return
+	}
+	if hasScheme {
 		scheme = u.Scheme
-		host = u.Host
 	}
 
 	cfg.peers = append(cfg.peers, peer)
-	cfg.addrs[peer] = &backendAddr{scheme: scheme, host: host}
+	cfg.addrs[peer] = &backendAddr{scheme: scheme, host: u.Host}
+}
+
+// parseOrigin parses an upstream pattern or backend address, which must name
+// an origin and nothing else. Anything more would be silently dropped when
+// requests are rewritten, so a misconfiguration would only surface per request
+// as a failing peer. A URL without a scheme ("//host:port") is accepted for
+// backends that inherit the upstream scheme.
+func parseOrigin(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "" && u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported scheme %q", u.Scheme)
+	}
+	if u.Hostname() == "" {
+		return nil, errors.New("missing host")
+	}
+	if u.User != nil {
+		return nil, errors.New("user information is not supported")
+	}
+	if u.Path != "" && u.Path != "/" {
+		return nil, errors.New("path is not supported")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return nil, errors.New("query is not supported")
+	}
+	if u.Fragment != "" {
+		return nil, errors.New("fragment is not supported")
+	}
+	return u, nil
 }
 
 func (cfg *upstreamConfig) normalize() {
@@ -628,9 +702,12 @@ func (t *Transport) registerExplicitUpstream(upstream UpstreamConfig) {
 }
 
 func (t *Transport) registerUpstream(pattern string, cfg *upstreamConfig) {
-	u, err := url.Parse(pattern)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		t.addInitError(fmt.Errorf("cslb: invalid upstream pattern: %q", pattern))
+	u, err := parseOrigin(pattern)
+	if err == nil && u.Scheme == "" {
+		err = errors.New("missing scheme")
+	}
+	if err != nil {
+		t.addInitError(fmt.Errorf("cslb: invalid upstream pattern: %q: %w", pattern, err))
 		return
 	}
 
@@ -656,17 +733,29 @@ func (t *Transport) registerUpstream(pattern string, cfg *upstreamConfig) {
 		return
 	}
 	usablePeers := 0
+	totalWeight := 0
 	for _, peer := range cfg.peers {
 		if !peer.Down {
 			usablePeers++
 		}
+		// Each weight is at most maxServerWeight, so the sum cannot overflow
+		// before the limit check below.
+		totalWeight += max(peer.Weight, 1)
 	}
 	if usablePeers == 0 {
 		t.addInitError(fmt.Errorf("cslb: upstream %q has no usable backends: all servers are down", pattern))
 		return
 	}
+	weightLimit := maxUpstreamWeight
+	if cfg.algo == AlgoHashConsistent {
+		weightLimit = maxConsistentHashWeight
+	}
+	if totalWeight > weightLimit {
+		t.addInitError(fmt.Errorf("cslb: upstream %q: total server weight %d exceeds %d", pattern, totalWeight, weightLimit))
+		return
+	}
 
-	key := upstreamKey{scheme: u.Scheme, host: u.Host}
+	key := newUpstreamKey(u.Scheme, u.Host)
 	if _, exists := t.upstreams[key]; exists {
 		t.addInitError(fmt.Errorf("cslb: duplicate upstream for %s://%s", u.Scheme, u.Host))
 		return
@@ -750,8 +839,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return failRoundTrip(req, err)
 	}
 
-	key := upstreamKey{scheme: req.URL.Scheme, host: req.URL.Host}
-	ups, ok := t.upstreams[key]
+	ups, ok := t.upstreams[newUpstreamKey(req.URL.Scheme, req.URL.Host)]
 	if !ok {
 		return t.roundTrip(t.transport, req)
 	}
@@ -769,11 +857,26 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cleanup != nil {
-		defer cleanup()
+	var stream io.Reader
+	if getBody == nil && baseReq.Body != http.NoBody {
+		stream = baseReq.Body
 	}
+	body := newRequestBody(getBody, stream, cleanup)
 
-	reqCtx := req.Context()
+	resp, err := t.forward(baseReq, ups, pk, body)
+	if resp == nil {
+		body.releaseNow()
+	} else {
+		// The body may still be streaming to the backend that produced resp; it
+		// is released once the underlying RoundTripper closes it.
+		body.release()
+	}
+	return resp, err
+}
+
+// forward runs the attempt loop for a request matched to ups.
+func (t *Transport) forward(baseReq *http.Request, ups *upstream, pk Picker, body *requestBody) (*http.Response, error) {
+	reqCtx := baseReq.Context()
 
 	// Carries the most recent attempt across iterations so that, when peers
 	// are exhausted, the caller sees the same (resp, err) the last upstream
@@ -817,22 +920,22 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		// Preserve original Host header
 		if attemptReq.Host == "" {
-			attemptReq.Host = key.host
+			attemptReq.Host = baseReq.URL.Host
 		}
 
 		// Rewrite to selected backend
 		attemptReq.URL.Scheme = addr.scheme
 		attemptReq.URL.Host = addr.host
 
-		// Restore body for this attempt
-		if getBody != nil {
-			body, err := getBody()
+		// Give this attempt its own body
+		if !body.empty() {
+			attemptBody, err := body.next()
 			if err != nil {
 				doneNeutral(pk, peer)
 				return nil, err
 			}
-			attemptReq.Body = body
-			attemptReq.GetBody = getBody
+			attemptReq.Body = attemptBody
+			attemptReq.GetBody = body.getBody()
 		}
 
 		// Apply per-attempt timeout
@@ -942,7 +1045,9 @@ func (t *Transport) decideAttempt(req *http.Request, resp *http.Response, err er
 	neutral := isRoundTripperContractError(err)
 
 	if !t.shouldRetry(resp, err) {
-		return attemptDecision{neutral: neutral}
+		// nginx reports every error and timeout to the peer as a failure,
+		// whether or not proxy_next_upstream lets the request move on.
+		return attemptDecision{failed: err != nil && !neutral, neutral: neutral}
 	}
 
 	blockedNonIdempotent := sent && isNonIdempotentMethod(req.Method) && !t.retryNonIdempotent
@@ -1077,12 +1182,12 @@ func (t *Transport) prepareBody(req *http.Request, replayPossible bool) (getBody
 		return req.GetBody, func() { initialBody.Close() }, nil
 	}
 
-	if req.Body == nil {
+	if req.Body == nil || req.Body == http.NoBody {
 		return nil, nil, nil
 	}
 
 	// Optimization: seekable body (e.g., *os.File)
-	if seeker, ok := req.Body.(io.Seeker); ok {
+	if seeker, ok := req.Body.(io.ReadSeeker); ok {
 		initialBody := req.Body
 		startPos, err := seeker.Seek(0, io.SeekCurrent)
 		if err != nil {
@@ -1094,11 +1199,13 @@ func (t *Transport) prepareBody(req *http.Request, replayPossible bool) (getBody
 		// detect an at/past-EOF seeker. Leave -1 (chunked) or any value
 		// already <= remaining alone, so we do not change request framing or
 		// forward more bytes than the caller declared.
+		end := int64(-1)
 		if endPos, seekErr := seeker.Seek(0, io.SeekEnd); seekErr == nil {
 			if _, err := seeker.Seek(startPos, io.SeekStart); err != nil {
 				initialBody.Close()
 				return nil, nil, err
 			}
+			end = endPos
 			remaining := endPos - startPos
 			if remaining < 0 {
 				remaining = 0
@@ -1120,26 +1227,23 @@ func (t *Transport) prepareBody(req *http.Request, replayPossible bool) (getBody
 			// Otherwise (ContentLength == -1 chunked, or 0/positive already
 			// <= remaining) leave framing untouched.
 		}
+		src := &replaySource{rs: seeker}
 		return func() (io.ReadCloser, error) {
-			_, err := seeker.Seek(startPos, io.SeekStart)
-			if err != nil {
-				return nil, err
-			}
-			return io.NopCloser(initialBody), nil
+			return src.reader(startPos, end), nil
 		}, func() { initialBody.Close() }, nil
 	}
 
 	if !replayPossible {
 		// Do not drain a genuinely streaming body before the only attempt that
-		// can consume it. Suppress the underlying RoundTripper's Close so the
-		// same unread stream remains available after a standard *http.Transport
-		// connection failure that happened before any request bytes were
-		// written. Such a failure is the only path that can reach another peer
-		// without replayPossible. A sent attempt is terminal either because
-		// there is no other usable peer or because of the non-idempotent gate;
-		// errors from custom RoundTrippers are conservatively treated as sent.
+		// can consume it. Returning no getBody makes RoundTrip share the unread
+		// stream between attempts without letting an attempt close it, so it
+		// remains available after a standard *http.Transport connection failure
+		// that happened before any request bytes were written. Such a failure is
+		// the only path that can reach another peer without replayPossible. A
+		// sent attempt is terminal either because there is no other usable peer
+		// or because of the non-idempotent gate; errors from custom
+		// RoundTrippers are conservatively treated as sent.
 		initialBody := req.Body
-		req.Body = io.NopCloser(initialBody)
 		return nil, func() { initialBody.Close() }, nil
 	}
 
@@ -1178,13 +1282,11 @@ func prepareSpilledBody(req *http.Request, f bodyTempFile) (getBody func() (io.R
 		os.Remove(f.Name())
 		return nil, nil, err
 	}
-	req.ContentLength = stat.Size()
+	size := stat.Size()
+	req.ContentLength = size
+	src := &replaySource{rs: f}
 	return func() (io.ReadCloser, error) {
-			_, err := f.Seek(0, 0)
-			if err != nil {
-				return nil, err
-			}
-			return io.NopCloser(f), nil
+			return src.reader(0, size), nil
 		}, func() {
 			name := f.Name()
 			f.Close()

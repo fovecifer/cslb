@@ -44,7 +44,7 @@ func TestBuildChashRing_PointCount(t *testing.T) {
 	for _, p := range peers {
 		p.init()
 	}
-	ring := buildChashRing(peers)
+	ring := buildChashRing(peers, maxConsistentHashWeight)
 
 	// CRC32 collisions for ~1000 points are vanishingly rare; expect exact count.
 	expected := (1 + 5) * consistentReplicas
@@ -85,7 +85,7 @@ func TestBuildChashRing_KetamaCompatibility(t *testing.T) {
 	peer := &Peer{Addr: "10.0.0.1:8080", Weight: 1}
 	peer.init()
 
-	ring := buildChashRing([]*Peer{peer})
+	ring := buildChashRing([]*Peer{peer}, maxConsistentHashWeight)
 	if len(ring) == 0 {
 		t.Fatalf("empty ring")
 	}
@@ -108,10 +108,10 @@ func TestBuildChashRing_KetamaCompatibility(t *testing.T) {
 }
 
 func TestBuildChashRing_EmptyPeers(t *testing.T) {
-	if got := buildChashRing(nil); got != nil {
+	if got := buildChashRing(nil, maxConsistentHashWeight); got != nil {
 		t.Errorf("nil peers should produce nil ring, got %v", got)
 	}
-	if got := buildChashRing([]*Peer{}); got != nil {
+	if got := buildChashRing([]*Peer{}, maxConsistentHashWeight); got != nil {
 		t.Errorf("empty peers should produce nil ring, got %v", got)
 	}
 }
@@ -133,8 +133,8 @@ func TestBuildChashRing_ReproducibleAcrossCalls(t *testing.T) {
 		return ps
 	}
 
-	a := buildChashRing(mkPeers())
-	b := buildChashRing(mkPeers())
+	a := buildChashRing(mkPeers(), maxConsistentHashWeight)
+	b := buildChashRing(mkPeers(), maxConsistentHashWeight)
 	if len(a) != len(b) {
 		t.Fatalf("ring sizes differ: %d vs %d", len(a), len(b))
 	}

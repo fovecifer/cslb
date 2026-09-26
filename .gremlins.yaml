@@ -1,0 +1,12 @@
+# Mutation testing quality gate (see .github/workflows/mutation.yml).
+#
+# Thresholds must be set here, not with --threshold-* flags: gremlins v0.6.0
+# reads float flags back from viper as strings, so flag values are silently
+# ignored. A run fails when a value is at or below its threshold, so 100 can
+# never pass. The remaining lived mutants are equivalent (for example capacity
+# hints, equality-only counters, and exact-instant time comparisons); raise the
+# thresholds as tests improve rather than lowering them to make a run pass.
+unleash:
+  threshold:
+    efficacy: 90
+    mutant-coverage: 98

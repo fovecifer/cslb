@@ -26,12 +26,14 @@ jobs:
       - name: Install Gremlins
         run: go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0
 
+      # Thresholds live in .gremlins.yaml; gremlins ignores --threshold-* flags.
+      # Gremlins derives per-mutant timeouts from its coverage run, so a cached
+      # test result would make almost every mutant time out.
       - name: Run mutation testing
         run: |
+          go clean -testcache
           gremlins unleash \
             --workers=4 \
-            --threshold-mcover=98 \
-            --threshold-efficacy=100 \
             --output=mutation-results.json \
             .
 

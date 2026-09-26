@@ -155,7 +155,7 @@ func (p *randomPicker) pickTwo() *Peer {
 		}
 
 		selected := peer
-		if peer.conns*previous.Weight > previous.conns*peer.Weight {
+		if compareLoad(peer, previous) > 0 {
 			selected = previous
 		}
 		p.commitPeer(selected, now)

@@ -90,12 +90,12 @@ func TestBalancerGroupAccessors(t *testing.T) {
 }
 
 func TestBuildChashRing_SkipsInvalidEntries(t *testing.T) {
-	if ring := buildChashRing([]*Peer{nil, {Addr: "zero", Weight: 0}}); ring != nil {
+	if ring := buildChashRing([]*Peer{nil, {Addr: "zero", Weight: 0}}, maxConsistentHashWeight); ring != nil {
 		t.Fatalf("invalid peers produced ring points: %v", ring)
 	}
 
 	valid := &Peer{Addr: "10.0.0.1:8080", Weight: 1}
-	ring := buildChashRing([]*Peer{nil, {Addr: "zero", Weight: 0}, valid})
+	ring := buildChashRing([]*Peer{nil, {Addr: "zero", Weight: 0}, valid}, maxConsistentHashWeight)
 	if len(ring) == 0 {
 		t.Fatal("valid peer did not produce ring points")
 	}
@@ -515,7 +515,7 @@ func TestTransport_CancellationWhileBufferingStopsBeforeSelection(t *testing.T) 
 func TestTransport_PrepareBodyFailureStopsBeforeSelection(t *testing.T) {
 	wantErr := errors.New("body position unavailable")
 	body := &failingSeekBody{
-		Reader: strings.NewReader("payload"),
+		reader: strings.NewReader("payload"),
 		err:    wantErr,
 		failAt: 1,
 	}
@@ -692,12 +692,18 @@ func (b *cancelOnReadBody) Close() error {
 	return nil
 }
 
+// failingSeekBody deliberately does not implement io.ReaderAt, so replay reads
+// go through Seek.
 type failingSeekBody struct {
-	*strings.Reader
+	reader *strings.Reader
 	err    error
 	failAt int
 	seeks  int
 	closed bool
+}
+
+func (b *failingSeekBody) Read(p []byte) (int, error) {
+	return b.reader.Read(p)
 }
 
 func (b *failingSeekBody) Seek(offset int64, whence int) (int64, error) {
@@ -705,7 +711,7 @@ func (b *failingSeekBody) Seek(offset int64, whence int) (int64, error) {
 	if b.seeks == b.failAt {
 		return 0, b.err
 	}
-	return b.Reader.Seek(offset, whence)
+	return b.reader.Seek(offset, whence)
 }
 
 func (b *failingSeekBody) Close() error {
@@ -741,7 +747,7 @@ func TestPrepareBody_SeekFailures(t *testing.T) {
 	t.Run("initial position", func(t *testing.T) {
 		wantErr := errors.New("current position unavailable")
 		body := &failingSeekBody{
-			Reader: strings.NewReader("payload"),
+			reader: strings.NewReader("payload"),
 			err:    wantErr,
 			failAt: 1,
 		}
@@ -759,7 +765,7 @@ func TestPrepareBody_SeekFailures(t *testing.T) {
 	t.Run("restore after size probe", func(t *testing.T) {
 		wantErr := errors.New("initial position could not be restored")
 		body := &failingSeekBody{
-			Reader: strings.NewReader("payload"),
+			reader: strings.NewReader("payload"),
 			err:    wantErr,
 			failAt: 3,
 		}
@@ -777,7 +783,7 @@ func TestPrepareBody_SeekFailures(t *testing.T) {
 	t.Run("replay position", func(t *testing.T) {
 		wantErr := errors.New("replay position unavailable")
 		body := &failingSeekBody{
-			Reader: strings.NewReader("payload"),
+			reader: strings.NewReader("payload"),
 			err:    wantErr,
 			failAt: 4,
 		}
@@ -792,11 +798,13 @@ func TestPrepareBody_SeekFailures(t *testing.T) {
 		}
 
 		replay, err := getBody()
-		if replay != nil {
-			replay.Close()
+		if err != nil {
+			t.Fatalf("getBody: %v", err)
 		}
+		_, err = io.ReadAll(replay)
+		replay.Close()
 		if !errors.Is(err, wantErr) {
-			t.Fatalf("getBody error = %v, want %v", err, wantErr)
+			t.Fatalf("replay read error = %v, want %v", err, wantErr)
 		}
 		cleanup()
 		if !body.closed {
@@ -833,7 +841,7 @@ func TestPrepareBody_ClampsNegativeRemainingLength(t *testing.T) {
 	}
 }
 
-func TestPrepareBody_ReplayAfterCleanupReturnsSeekError(t *testing.T) {
+func TestPrepareBody_ReplayAfterCleanupFailsToRead(t *testing.T) {
 	body := newTrackingBody("payload")
 	req := &http.Request{Body: body}
 	transport := NewTransport(WithMaxBodyBuffer(0))
@@ -848,11 +856,12 @@ func TestPrepareBody_ReplayAfterCleanupReturnsSeekError(t *testing.T) {
 	cleanup()
 
 	replay, err := getBody()
-	if replay != nil {
-		replay.Close()
+	if err != nil {
+		t.Fatalf("getBody: %v", err)
 	}
-	if err == nil {
-		t.Fatal("getBody succeeded after its temporary file was closed")
+	defer replay.Close()
+	if _, err := io.ReadAll(replay); err == nil {
+		t.Fatal("replay read succeeded after its temporary file was closed")
 	}
 }
 
