@@ -44,7 +44,7 @@ func NewHashConsistent(peers []*Peer) *HashConsistent {
 	rr := NewRoundRobin(peers)
 	return &HashConsistent{
 		rr:     rr,
-		points: buildChashRing(rr.primary.Peers),
+		points: buildChashRing(rr.primary.Peers, maxConsistentHashWeight),
 	}
 }
 
@@ -135,15 +135,22 @@ func (p *chashPicker) Done(peer *Peer, failed bool) {
 // weight*160 points, position = chained crc32(host \0 port PREV_HASH_LE).
 // The result is sorted ascending and deduplicated, matching the layout
 // nginx's ngx_http_upstream_update_chash() builds.
-func buildChashRing(peers []*Peer) []chashPoint {
-	totalPoints := 0
+//
+// Peers whose combined weight exceeds maxWeight produce no ring, so selection
+// falls back to round-robin instead of allocating an unbounded ring. Transport
+// rejects such configurations up front.
+func buildChashRing(peers []*Peer, maxWeight int) []chashPoint {
+	totalWeight := 0
 	for _, p := range peers {
 		if p == nil || p.Weight <= 0 {
 			continue
 		}
-		totalPoints += p.Weight * consistentReplicas
+		if p.Weight > maxWeight-totalWeight {
+			return nil
+		}
+		totalWeight += p.Weight
 	}
-	pts := make([]chashPoint, 0, totalPoints)
+	pts := make([]chashPoint, 0, totalWeight*consistentReplicas)
 	for _, p := range peers {
 		if p == nil || p.Weight <= 0 {
 			continue

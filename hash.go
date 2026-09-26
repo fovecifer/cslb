@@ -65,7 +65,8 @@ func (p *hashPicker) Pick() *Peer {
 	group := p.PrimaryGroup()
 
 	// Empty keys and single-peer groups use the round-robin fast path in nginx.
-	if p.key == "" || len(group.Peers) < 2 {
+	modulus, ok := hashModulus(group)
+	if p.key == "" || len(group.Peers) < 2 || !ok {
 		return p.RRPicker.Pick()
 	}
 
@@ -83,7 +84,7 @@ func (p *hashPicker) Pick() *Peer {
 		p.hash += (hash >> 16) & 0x7fff
 		p.rehash++
 
-		w := int(p.hash % uint32(group.TotalWeight))
+		w := int(p.hash % modulus)
 
 		var selected *Peer
 		for _, peer := range group.Peers {

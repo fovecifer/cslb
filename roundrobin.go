@@ -37,13 +37,25 @@ func (rr *RoundRobin) Backup() *PeerGroup { return rr.backup }
 type RRPicker struct {
 	primary     *PeerGroup
 	backup      *PeerGroup
-	tried       map[*Peer]bool // nginx uses a bitmap; Go map is cleaner
+	tried       map[*Peer]peerMark // nginx uses a bitmap; Go map is cleaner
 	backupPhase bool
 
 	// probeChecked records the checked timestamps this picker advanced in
 	// commitPeer, so a neutral release can put them back.
 	probeChecked map[*Peer]probeCheck
 }
+
+// peerMark records what one picker has done with a peer.
+type peerMark uint8
+
+const (
+	// markTried excludes the peer from further selection by this picker.
+	markTried peerMark = 1 << iota
+	// markActive means the peer was selected and its Done is still pending.
+	// It makes Done idempotent: a repeated Done, or a Done for a peer this
+	// picker never selected, must not release a connection count twice.
+	markActive
+)
 
 // probeCheck remembers one advanced checked timestamp: prior is the value to
 // restore, seq is the peer's version counter immediately after this picker
@@ -60,7 +72,7 @@ func NewRRPicker(primary, backup *PeerGroup) *RRPicker {
 	return &RRPicker{
 		primary: primary,
 		backup:  backup,
-		tried:   make(map[*Peer]bool),
+		tried:   make(map[*Peer]peerMark),
 	}
 }
 
@@ -114,20 +126,20 @@ func (rr *RRPicker) pickFromGroup(group *PeerGroup) *Peer {
 
 	if group.single {
 		peer := group.Peers[0]
-		if rr.tried[peer] || peer.Down ||
+		if rr.Tried(peer) || peer.Down ||
 			(peer.MaxConns > 0 && peer.conns >= peer.MaxConns) {
 			return nil
 		}
 
 		peer.conns++
-		rr.tried[peer] = true
+		rr.tried[peer] = markTried | markActive
 		return peer
 	}
 
 	now := time.Now()
 	best := smoothWeightedPeer(group.Peers, func(peer *Peer) bool {
 		// Skip already tried (nginx: rrp->tried[n] & m)
-		if rr.tried[peer] {
+		if rr.Tried(peer) {
 			return false
 		}
 
@@ -203,12 +215,14 @@ func (rr *RRPicker) commitPeer(peer *Peer, now time.Time) *Peer {
 		rr.probeChecked[peer] = probeCheck{prior: prior, seq: peer.checkedSeq}
 	}
 	peer.conns++
-	rr.SetTried(peer)
+	rr.tried[peer] = markTried | markActive
 	return peer
 }
 
 // Done implements Picker.Done.
 // Corresponds to nginx's ngx_http_upstream_free_round_robin_peer() (lines 782-863).
+// Only the first Done for a peer selected by this picker has an effect; later
+// calls, and calls for peers this picker never selected, are ignored.
 func (rr *RRPicker) Done(peer *Peer, failed bool) {
 	rr.done(peer, failed, false)
 }
@@ -221,9 +235,12 @@ func (rr *RRPicker) doneNeutral(peer *Peer) {
 }
 
 func (rr *RRPicker) done(peer *Peer, failed bool, neutral bool) {
-	if peer == nil {
+	// Ignore a Done for a peer that has no pending selection by this picker:
+	// nil, never selected, or already released.
+	if peer == nil || rr.tried[peer]&markActive == 0 {
 		return
 	}
+	rr.tried[peer] &^= markActive
 
 	group := rr.primary
 	if peer.Backup && rr.backup != nil {
@@ -282,12 +299,12 @@ func (rr *RRPicker) done(peer *Peer, failed bool, neutral bool) {
 
 // Tried returns whether a peer has been tried (used by wrapping algorithms).
 func (rr *RRPicker) Tried(p *Peer) bool {
-	return rr.tried[p]
+	return rr.tried[p]&markTried != 0
 }
 
 // SetTried marks a peer as tried (used by wrapping algorithms).
 func (rr *RRPicker) SetTried(p *Peer) {
-	rr.tried[p] = true
+	rr.tried[p] |= markTried
 }
 
 // PrimaryGroup returns the primary peer group.

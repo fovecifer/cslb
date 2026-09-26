@@ -111,11 +111,26 @@ func main() {
 upstream-level and server-level configuration, similar to nginx's
 `upstream { server ...; }` blocks.
 For fail-fast validation during construction, use `NewTransportE(...)` and
-handle the returned error. It rejects non-positive explicit weights, negative
-connection/failure limits, negative timeouts or body-buffer sizes, and unknown
-algorithm values. It also rejects nil custom transports or retry conditions and
-upstreams whose servers are all marked `Down()`. An upstream containing only
-usable backup servers remains valid.
+handle the returned error. It rejects non-positive explicit weights, weights
+above the [limits](#server-options), negative connection/failure limits,
+negative timeouts or body-buffer sizes, and unknown algorithm values. It also
+rejects nil custom transports or retry conditions and upstreams whose servers
+are all marked `Down()`. An upstream containing only usable backup servers
+remains valid.
+
+Upstream patterns and backend addresses must name an origin and nothing else:
+an `http` or `https` scheme (backends may omit it and inherit the upstream's),
+a host, and an optional port. Paths, queries, fragments, and user information
+are rejected at construction instead of being silently dropped when requests
+are rewritten.
+
+Requests are matched to an upstream by scheme and host, compared
+case-insensitively and ignoring an explicit default port, so
+`http://API.example.com:80/` matches `Upstream("http://api.example.com")`.
+Requests that match no upstream are passed to the underlying RoundTripper
+unchanged. `Transport.CloseIdleConnections` closes idle connections of the
+underlying RoundTripper and of the per-upstream transports created for
+`ProxySSLName`; `http.Client.CloseIdleConnections` forwards to it.
 
 ## Runnable Examples
 
@@ -187,12 +202,15 @@ upstream; see [TLS server name](#tls-server-name) below.
 
 | Option | Description |
 |--------|-------------|
-| `Weight(w)` | Selection weight (default 1) |
+| `Weight(w)` | Selection weight (default 1, at most 65536) |
 | `MaxFails(n)` | Failures before temporarily disabling (default 1; 0 disables suppression) |
 | `FailTimeout(d)` | Duration a failed server stays disabled (default 10s; explicit 0 is preserved) |
 | `MaxConns(n)` | Max concurrent connections (0 = unlimited) |
 | `Backup()` | Only used when all primary backends are unavailable |
 | `Down()` | Initially marked as down |
+
+The sum of server weights in one upstream may not exceed 16,777,216, or 65,536
+for `.HashConsistent(...)`, whose ring holds 160 points per unit of weight.
 
 ## Retry and Failure Semantics
 
@@ -258,7 +276,9 @@ having sent the request.
 
 Retry selection and peer health are separate: configured `403` and `404`
 responses can move to another peer but do not increment `max_fails` or reduce
-effective weight, matching nginx.
+effective weight, matching nginx. Conversely, a transport error or timeout
+always counts against the peer, even when a custom `WithNextUpstream` condition
+declines to retry it.
 
 ## Request Body Buffering
 
@@ -269,6 +289,15 @@ usable server, or when the default non-idempotent gate makes a sent `POST`,
 `LOCK`, or `PATCH` terminal. A connection failure before a standard
 `*http.Transport` writes the request can still fail over without consuming the
 stream.
+
+Following the `http.RoundTripper` contract, the request body is released when
+the underlying RoundTripper closes it, not when `RoundTrip` returns. A response
+can arrive before the upload finishes, for example from a full-duplex or
+early-response endpoint, and the upload keeps streaming afterwards. The caller's
+body is closed, and any temporary file removed, once every attempt's body has
+been closed; if `RoundTrip` returns an error they are released immediately.
+Replays of a seekable or spilled body each read at their own offset, so a
+retry cannot interleave with a superseded attempt that is still being written.
 
 `WithMaxBodyBuffer` is the in-memory threshold, not a total request-size limit.
 Setting it to zero sends every non-empty buffered body directly to a temporary

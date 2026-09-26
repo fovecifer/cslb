@@ -39,6 +39,11 @@ func (set serverFieldSet) has(field serverFieldSet) bool {
 }
 
 // Peer represents a backend server.
+//
+// A balancer takes ownership of the peers it is built from: BuildGroups
+// initializes their selection state, and from then on every field is read and
+// written under the owning PeerGroup lock. Do not share a Peer between
+// balancers or modify its exported fields after construction.
 type Peer struct {
 	Addr   string
 	Weight int
@@ -99,7 +104,8 @@ type PeerGroup struct {
 	single      bool // nginx single-peer fast path; false whenever backups exist
 }
 
-// BuildGroups splits peers into primary and backup groups.
+// BuildGroups splits peers into primary and backup groups. It initializes and
+// takes ownership of the peers; see Peer.
 func BuildGroups(peers []*Peer) (primary *PeerGroup, backup *PeerGroup) {
 	primary = &PeerGroup{}
 	backup = &PeerGroup{}
@@ -148,6 +154,7 @@ type Picker interface {
 
 	// Done reports the result of a request to the selected peer.
 	// Corresponds to nginx's r->upstream->peer.free(pc, data, state).
+	// Built-in pickers ignore repeated calls and peers they never selected.
 	Done(peer *Peer, failed bool)
 }
 
@@ -204,15 +211,27 @@ func PickWithRetry(b Balancer, tryFunc func(addr string) error) (*Peer, error) {
 			return nil, ErrNoPeerAvailable
 		}
 
-		err := tryFunc(p.Addr)
-		if err == nil {
-			pk.Done(p, false)
+		if err := tryPeer(pk, p, tryFunc); err == nil {
 			return p, nil
 		}
-
-		pk.Done(p, true)
 		// Loop continues — picker tracks tried peers internally
 	}
+}
+
+// tryPeer runs tryFunc against p and reports the outcome. If tryFunc panics,
+// the peer is released without a health signal before the panic continues, so
+// its connection count is not leaked.
+func tryPeer(pk Picker, p *Peer, tryFunc func(addr string) error) error {
+	reported := false
+	defer func() {
+		if !reported {
+			doneNeutral(pk, p)
+		}
+	}()
+	err := tryFunc(p.Addr)
+	reported = true
+	pk.Done(p, err != nil)
+	return err
 }
 
 // ErrNoPeerAvailable is returned when no peer can be selected.

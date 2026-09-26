@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `Transport.CloseIdleConnections`, which closes idle connections of the
+  underlying RoundTripper and of the per-upstream transports cloned for
+  `ProxySSLName`. `http.Client.CloseIdleConnections` now reaches them.
 - `ErrNilResponseBody`, returned when the underlying `http.RoundTripper` produces
   a response with a nil `Body` in violation of its contract.
 - Test suites for fuzz/property invariants, concurrent peer-state transitions,
@@ -31,6 +34,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   spills to a temporary file instead of silently restoring the 32 MB default.
 - IP-Hash now hashes over the backup group after Round-Robin enters the backup
   phase, matching nginx instead of continuing to inspect the primary group.
+- Upstream matching now compares scheme and host case-insensitively and ignores
+  an explicit default port, so `http://API.example.com:80/` no longer bypasses
+  the `http://api.example.com` upstream and goes to real DNS. Upstreams that
+  differ only in this way are rejected as duplicates.
+- Upstream patterns and backend addresses must be `http` or `https` origins.
+  Unsupported schemes, paths, queries, fragments, user information, and missing
+  hosts are rejected during construction instead of being silently dropped
+  and later counted as peer failures.
+- Server weights are limited to 65536, and the sum of weights in an upstream to
+  16,777,216 (65,536 for consistent hashing), all checked during construction.
+- A transport error or timeout now always counts as a peer failure, even when a
+  custom `WithNextUpstream` condition declines to retry it. Previously such an
+  error was reported as a success, so a dead peer was never quarantined and a
+  recovering peer had its failure counter cleared, unlike nginx.
+- Built-in pickers ignore a repeated `Done` and a `Done` for a peer they never
+  selected, instead of decrementing the connection count again and driving it
+  negative. `PickWithRetry` releases the peer neutrally if `tryFunc` panics.
+- `Hash` and `HashConsistent` document that the key function must not read the
+  request body, and `Peer` documents that a balancer takes ownership of the
+  peers it is built from.
 - `RRPicker.Done` now uses the peer's `Backup` flag to resolve its owning group
   directly instead of linearly scanning all primary peers on every attempt.
 
@@ -40,6 +63,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Request bodies are no longer closed, and temporary body files no longer
+  deleted, as soon as `RoundTrip` returns. A RoundTripper may keep sending the
+  body after the response headers arrive (full-duplex or early-response
+  endpoints), and such uploads were aborted with `io: read/write on closed pipe`
+  or truncated. The body is now released once every attempt's body has been
+  closed by the underlying RoundTripper, or immediately when `RoundTrip`
+  returns an error.
+- Replays of a seekable or spilled request body no longer share one file
+  offset. Each attempt reads at its own offset, so a retry cannot interleave
+  with a superseded attempt that the RoundTripper is still writing.
+- Out-of-range weights no longer panic with an integer divide by zero in
+  Hash and IP-Hash selection, and can no longer overflow the Least-Conn and
+  Random-Two load comparisons or make a consistent-hash ring allocate without
+  bound. Groups built directly with out-of-range totals fall back to
+  round-robin.
 - `WithRoundTripper(nil)` and `WithNextUpstream(nil)` now fail during
   construction instead of being silently replaced by their defaults.
 - Upstreams whose servers are all marked `Down()` now fail during construction
