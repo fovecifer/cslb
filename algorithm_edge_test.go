@@ -293,7 +293,12 @@ func TestAlgorithms_ResetFailuresAfterSuccessfulProbe(t *testing.T) {
 					peer.Down = true
 				}
 			}
-			target.checked = time.Now().Add(-2 * target.FailTimeout)
+			// Age the whole failure, not just checked. A real probe runs at
+			// least fail_timeout after the failure, so accessed is strictly
+			// before the probe's checked; leaving accessed at the failure time
+			// lets a coarse clock (Windows) give both the same instant.
+			target.accessed = time.Now().Add(-2 * target.FailTimeout)
+			target.checked = target.accessed
 
 			probePicker := newPicker(7)
 			probe := probePicker.Pick()
