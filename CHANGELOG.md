@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   resource cleanup under repeated failures, real TCP/TLS/HTTP/2/proxy faults,
   external-package API contracts, frozen nginx mappings, and performance
   benchmarks.
-- Scheduled mutation testing with a 100% test-efficacy gate. CI now enforces
+- Scheduled mutation testing gated on 90% test efficacy and 98% mutant
+  coverage, configured in `.gremlins.yaml` (gremlins ignores its
+  `--threshold-*` flags, so the earlier flag-based gate never failed). CI now enforces
   zero uncovered statements, runs tests in randomized order, smoke-tests fuzz
   targets and benchmarks, and covers Go 1.21 plus current Linux, macOS, and
   Windows environments.
